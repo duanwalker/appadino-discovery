@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# Environment / secrets
+.env
+.env.*
+*.pfx
+
+# Bicep
+infra/*.bicepparam.local
+main.json
+*.bicep.json
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

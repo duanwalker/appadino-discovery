@@ -1,0 +1,31 @@
+name: Infra Deploy
+
+# Manual-dispatch only — Phase 1 infra changes are deployed deliberately, not on every push.
+# Requires OIDC federated credentials configured for this repo (AZURE_CLIENT_ID,
+# AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID secrets) before this can run; see infra/README.md.
+# Until that's set up, deploys are run locally via `az deployment group create`.
+on:
+  workflow_dispatch:
+    inputs:
+      resourceGroup:
+        description: "Target resource group"
+        required: true
+        default: "rg-appadino-discovery-dev"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Deploy Bicep
+        run: |
+          az deployment group create \
+            --resource-group ${{ inputs.resourceGroup }} \
+            --template-file infra/main.bicep \
+            --parameters infra/main.bicepparam \
+            --parameters postgresAdminPassword=${{ secrets.POSTGRES_ADMIN_PASSWORD }}
