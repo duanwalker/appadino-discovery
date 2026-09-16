@@ -46,6 +46,24 @@ the latest 2 filings per EIN into `filings` from the IRS 990 e-file index (curre
 
 Takes roughly 15-20 minutes end to end (national BMF is ~2M orgs; the 990 index spans ~90MB/year).
 
+### Filter + signal extraction (Stages 1-2, §4)
+
+```powershell
+./.venv/Scripts/python -m discovery.cli filter <client_id>
+```
+
+Stage 1 reads the client's active `icp_configs` row and runs a config-driven SQL recall filter
+over `organizations`/`filings` (revenue band, foundation-code and NTEE-prefix excludes) — no AI,
+no network calls. Stage 2 then resolves each survivor's up-to-2 filings to their IRS 990 e-file
+monthly ZIP archive (the old per-filing S3 URLs were deprecated Dec 2021 — see
+`discovery.stages.extract_signals` for how archive/member lookup works via `remotezip` range
+requests), parses the XML, fills in `filings`' financial columns, and computes derived signals into
+`signals`. Every filing that can't be resolved or parsed (unsupported ZIP compression, schema
+variance, network errors) is counted, not fatal — the run logs a `coverage_pct` so degraded
+extraction is visible without failing the job (§10).
+
+Only the ARCHITECT client (`client_id=2` in the dev DB) has a seeded `icp_configs` row so far.
+
 ## Tests
 
 ```powershell
@@ -54,9 +72,11 @@ Takes roughly 15-20 minutes end to end (national BMF is ~2M orgs; the 990 index 
 ./.venv/Scripts/python -m mypy src
 ```
 
-Tests exercise the pure transform functions (`transform_bmf_row`, `transform_index_row`,
-`latest_two_per_ein`) with fixture data — they don't hit the network or a live database, so they
-run in CI unchanged.
+Tests exercise pure functions only (`transform_bmf_row`, `transform_index_row`,
+`latest_two_per_ein`, `build_survivor_query`, `parse_990_xml`, `compute_signals`) with fixture
+data — they don't hit the network or a live database, so they run in CI unchanged.
+`tests/stages/fixtures/sample_990.xml` is a real filing fetched during G1.3 to ground the XML
+field-mapping tests in actual IRS data rather than schema docs alone.
 
 ## Building and pushing the image
 

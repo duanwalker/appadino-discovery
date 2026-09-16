@@ -7,7 +7,14 @@ from sqlalchemy import engine_from_config, pool
 
 from alembic import context
 from discovery.db import Base
-from discovery.models import Filing, Organization, Run  # noqa: F401 — registers metadata
+from discovery.models import (  # noqa: F401 — registers metadata
+    Client,
+    Filing,
+    IcpConfig,
+    Organization,
+    Run,
+    Signal,
+)
 
 config = context.config
 
