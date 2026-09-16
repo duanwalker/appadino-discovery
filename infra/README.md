@@ -34,11 +34,19 @@ is supplied only at deploy time.
 | `adisc-dev-kv` | Key Vault (RBAC-authorized). Seeded with `db-connection-string`. Add `anthropic-api-key` manually after deploy; `fullenrich-api-key` only if the E-gates (§8) pass |
 | `adisc-dev-law` / `adisc-dev-cae` | Log Analytics workspace + Container Apps environment |
 | `adisc-dev-ai` | Application Insights, wired to the same Log Analytics workspace |
-| `adisc-dev-pipeline-job` | Container Apps Job, cron-scheduled. **Runs a `mcr.microsoft.com/azure-cli` hello-world placeholder for the G1.1 acceptance test** — swapped for the real pipeline image (built from `/pipeline`) in G1.2 |
+| `adiscdevacr` | Container Registry (Basic), holds the `discovery-pipeline` image |
+| `adisc-dev-pipeline-job` | Container Apps Job, monthly cron. Runs `adiscdevacr.azurecr.io/discovery-pipeline:latest` — Stage 0 ingest (§4) as of G1.2 |
 
-The job's user-assigned managed identity has `Key Vault Secrets User` on the vault; no secrets are
-passed as plaintext environment variables. The signed-in operator (via `keyVaultAdminPrincipalId`)
-has `Key Vault Secrets Officer` to add/rotate secrets by hand.
+The job's user-assigned managed identity has `Key Vault Secrets User` on the vault and `AcrPull` on
+the registry; no secrets are passed as plaintext environment variables — `DATABASE_URL` is a
+Container Apps secret sourced directly from the `db-connection-string` Key Vault entry via the
+identity. The signed-in operator (via `keyVaultAdminPrincipalId`) has `Key Vault Secrets Officer` to
+add/rotate secrets by hand.
+
+**Deploy order matters the first time**: the Container Apps Job resource validates that its image
+tag actually exists in the registry, so on a from-scratch deploy, `az acr build` (see
+`pipeline/README.md`) must run once against the ACR *before* the job module can succeed — deploy
+everything else, build+push the image, then re-run the same deploy command.
 
 ## Adding the Anthropic API key
 
