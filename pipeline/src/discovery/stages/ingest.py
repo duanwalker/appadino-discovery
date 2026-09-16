@@ -39,6 +39,12 @@ RELEVANT_RETURN_TYPES = frozenset({"990", "990EZ"})
 
 BATCH_SIZE = 20_000
 
+# Matches organizations.ein / filings.ein (String(9)) and filings.object_id (String(30))
+# in discovery.models — a row failing these can't be inserted anyway, so it's dropped
+# here rather than crashing the whole batch on a DB error.
+EIN_LENGTH = 9
+OBJECT_ID_MAX_LENGTH = 30
+
 
 def default_target_years(as_of: datetime | None = None) -> list[int]:
     """Current submission year plus the 2 prior, to absorb the 12-18mo filing lag (§10)."""
@@ -66,11 +72,12 @@ def _clean_int(value: str | None) -> int | None:
 def transform_bmf_row(raw: dict[str, str]) -> dict[str, Any] | None:
     """Map one raw IRS BMF CSV row to an `organizations` upsert row.
 
-    Returns None if the row has no EIN (shouldn't happen, but a blank cell beats a
-    crashed ingest run).
+    Returns None if the row has no EIN, or the EIN isn't a valid 9-digit number
+    (shouldn't happen, but a blank cell beats a crashed ingest run — and a malformed
+    EIN would otherwise pollute the primary key of the shared national universe).
     """
     ein = _clean_str(raw.get("EIN"))
-    if ein is None:
+    if ein is None or len(ein) != EIN_LENGTH or not ein.isdigit():
         return None
     ruling = _clean_str(raw.get("RULING"))
     ruling_year = int(ruling[:4]) if ruling and len(ruling) >= 4 and ruling[:4].isdigit() else None
@@ -98,7 +105,16 @@ def transform_index_row(raw: dict[str, str], sub_year: int) -> dict[str, Any] | 
     ein = _clean_str(raw.get("EIN"))
     object_id = _clean_str(raw.get("OBJECT_ID"))
     tax_period = _clean_str(raw.get("TAX_PERIOD"))
-    if not (ein and object_id and tax_period and len(tax_period) >= 6 and tax_period[:6].isdigit()):
+    if not (
+        ein
+        and len(ein) == EIN_LENGTH
+        and ein.isdigit()
+        and object_id
+        and len(object_id) <= OBJECT_ID_MAX_LENGTH
+        and tax_period
+        and len(tax_period) >= 6
+        and tax_period[:6].isdigit()
+    ):
         return None
     return {
         "ein": ein,
@@ -164,7 +180,7 @@ def upsert_organizations(conn: psycopg.Connection, rows: Iterable[dict[str, Any]
         cur.execute(
             """
             CREATE TEMP TABLE IF NOT EXISTS staging_organizations (
-                ein text, name text, state text, city text, ntee text,
+                seq bigserial, ein text, name text, state text, city text, ntee text,
                 ruling_year integer, revenue_latest numeric, foundation_code text
             )
             """
@@ -208,6 +224,7 @@ def _flush_organizations_batch(conn: psycopg.Connection, batch: list[dict[str, A
             SELECT DISTINCT ON (ein)
                 ein, name, state, city, ntee, ruling_year, revenue_latest, foundation_code, now()
             FROM staging_organizations
+            ORDER BY ein, seq DESC
             ON CONFLICT (ein) DO UPDATE SET
                 name = EXCLUDED.name,
                 state = EXCLUDED.state,
@@ -229,7 +246,8 @@ def upsert_filings(conn: psycopg.Connection, rows: Iterable[dict[str, Any]]) -> 
         cur.execute(
             """
             CREATE TEMP TABLE IF NOT EXISTS staging_filings (
-                ein text, tax_year integer, form_type text, object_id text, xml_object_url text
+                seq bigserial, ein text, tax_year integer, form_type text,
+                object_id text, xml_object_url text
             )
             """
         )
@@ -259,6 +277,7 @@ def _flush_filings_batch(conn: psycopg.Connection, batch: list[dict[str, Any]]) 
             INSERT INTO filings (ein, tax_year, form_type, object_id, xml_object_url)
             SELECT DISTINCT ON (ein, object_id) ein, tax_year, form_type, object_id, xml_object_url
             FROM staging_filings
+            ORDER BY ein, object_id, seq DESC
             ON CONFLICT (ein, object_id) DO UPDATE SET
                 tax_year = EXCLUDED.tax_year,
                 form_type = EXCLUDED.form_type,
