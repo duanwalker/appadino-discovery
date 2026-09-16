@@ -31,7 +31,7 @@ is supplied only at deploy time.
 | Resource | Purpose |
 |---|---|
 | `adisc-dev-pg` | PostgreSQL Flexible Server (Burstable B1ms), `discovery` database |
-| `adisc-dev-kv` | Key Vault (RBAC-authorized). Seeded with `db-connection-string`. Add `anthropic-api-key` manually after deploy; `fullenrich-api-key` only if the E-gates (§8) pass |
+| `adisc-dev-kv` | Key Vault (RBAC-authorized). Seeded with `db-connection-string`. Add `appadino-discoveryAI-key` (Anthropic) manually after deploy; `fullenrich-api-key` only if the E-gates (§8) pass |
 | `adisc-dev-law` / `adisc-dev-cae` | Log Analytics workspace + Container Apps environment |
 | `adisc-dev-ai` | Application Insights, wired to the same Log Analytics workspace |
 | `adiscdevacr` | Container Registry (Basic), holds the `discovery-pipeline` image |
@@ -51,7 +51,7 @@ everything else, build+push the image, then re-run the same deploy command.
 ## Adding the Anthropic API key
 
 ```powershell
-az keyvault secret set --vault-name adisc-dev-kv --name anthropic-api-key --value <key>
+az keyvault secret set --vault-name adisc-dev-kv --name appadino-discoveryAI-key --value <key>
 ```
 
 ## CI/CD deploy

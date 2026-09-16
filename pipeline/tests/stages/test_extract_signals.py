@@ -1,12 +1,40 @@
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 from discovery.stages.extract_signals import (
+    _extract_website,
+    _strip_namespaces,
     _year_from_archive_url,
     compute_signals,
     parse_990_xml,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _irs990_from(inner_xml: str) -> ET.Element:
+    root = ET.fromstring(
+        f'<Return xmlns="http://www.irs.gov/efile"><ReturnData><IRS990>{inner_xml}'
+        "</IRS990></ReturnData></Return>"
+    )
+    _strip_namespaces(root)
+    irs990 = root.find("ReturnData/IRS990")
+    assert irs990 is not None
+    return irs990
+
+
+def test_extract_website_filters_placeholders() -> None:
+    for placeholder in ("NONE", "N/A", "n/a", "-", "NA"):
+        assert _extract_website(_irs990_from(f"<WebsiteAddressTxt>{placeholder}</WebsiteAddressTxt>")) is None
+
+
+def test_extract_website_keeps_real_domain() -> None:
+    irs990 = _irs990_from("<WebsiteAddressTxt>EXAMPLE.ORG</WebsiteAddressTxt>")
+    assert _extract_website(irs990) == "EXAMPLE.ORG"
+
+
+def test_extract_website_missing_tag_returns_none() -> None:
+    assert _extract_website(_irs990_from("<SomeOtherTag>x</SomeOtherTag>")) is None
 
 
 def test_parse_990_xml_real_filing() -> None:
@@ -24,6 +52,25 @@ def test_parse_990_xml_real_filing() -> None:
         "officers"
     ]
     assert len(result["officers"]) == 3
+
+    # G1.4 additions: mission/program text (the sole Stage 3 text source, §4) and the
+    # significant-change flag (evidence for the "at an inflection point" alignment
+    # criterion) — this filing has no WebsiteAddressTxt at all (only OwnWebsiteInd).
+    assert result["mission_text"] is not None
+    assert result["mission_text"].startswith("To facitate the integration")
+    assert result["website"] is None
+    assert result["significant_change_ind"] is True
+    assert len(result["program_text"]) == 3
+    assert result["program_text"][0] == {
+        "desc": (
+            "Held two one week long virtual training sessions for United States and "
+            "International students specializing in the state between lives as view "
+            "from a horizontal viewed of all lives rather than passing though each as "
+            "lived in the past with emphasis on relief in the present life."
+        ),
+        "expense": 43655,
+        "revenue": 55935,
+    }
 
 
 def test_parse_990_xml_missing_return_data_is_tolerated() -> None:

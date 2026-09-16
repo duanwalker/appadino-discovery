@@ -92,7 +92,7 @@ resource keyVaultExisting 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
   ]
 }
 
-// Operator can manage secrets (add anthropic-api-key, fullenrich-api-key later)
+// Operator can manage secrets (add appadino-discoveryAI-key [Anthropic], fullenrich-api-key later)
 resource kvRoleAssignmentAdmin 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(keyVaultExisting.id, keyVaultAdminPrincipalId, 'kv-secrets-officer')
   scope: keyVaultExisting

@@ -64,6 +64,28 @@ extraction is visible without failing the job (§10).
 
 Only the ARCHITECT client (`client_id=2` in the dev DB) has a seeded `icp_configs` row so far.
 
+### Scoring (Stage 3, §4)
+
+```powershell
+$env:ANTHROPIC_API_KEY = az keyvault secret show --vault-name adisc-dev-kv --name appadino-discoveryAI-key --query value -o tsv
+./.venv/Scripts/python -m discovery.cli score <client_id> [--haiku-cut-n N]
+```
+
+Haiku pre-screens every scoreable survivor (has both extracted filing text and a computed signal)
+on mission/program text; Sonnet deep-scores the top N (config `haiku_cut_n`, default 3000) that
+survive the cut. Both passes run over the Message Batches API (§2, 50% discount) and write one
+`scores` row each (`stage='haiku'` / `stage='sonnet'`) per org, keyed on `(client_id, ein,
+icp_version, stage)`.
+
+Text inputs are 990 Part III mission/program narrative only — §4's "mission/program text from 990
++ website title/description" was narrowed to 990-only for this gate; see STATUS.md. `capacity` is
+always computed in Python from `signals`, never by the model. Every Sonnet response passes through
+`discovery.stages.score.enforce_hard_rules` before being persisted — a code-level, not just
+prompt-level, enforcement of §9 rules 1 (no demographic inference) and 2 (never "fully qualified").
+
+The Anthropic key in Key Vault is named `appadino-discoveryAI-key`, not `anthropic-api-key` — code
+and docs reference it as-is.
+
 ## Tests
 
 ```powershell

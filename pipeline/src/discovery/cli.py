@@ -15,6 +15,11 @@ def main(argv: list[str] | None = None) -> int:
         "filter", help="Run Stages 1-2 — recall filter + 990 signal extraction for a client"
     )
     filter_parser.add_argument("client_id", type=int)
+    score_parser = subparsers.add_parser("score", help="Run Stage 3 — Haiku + Sonnet scoring for a client")
+    score_parser.add_argument("client_id", type=int)
+    score_parser.add_argument(
+        "--haiku-cut-n", type=int, default=None, help="Override the Haiku-to-Sonnet cut size (config default: 3000)"
+    )
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -31,6 +36,20 @@ def main(argv: list[str] | None = None) -> int:
 
         counts = run_filter_and_signals(args.client_id)
         logger.info("filter complete: %s", counts)
+        return 0
+
+    if args.command == "score":
+        import os
+
+        import psycopg
+
+        from discovery.stages.filter import select_survivor_eins
+        from discovery.stages.run_scoring import run_scoring
+
+        with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+            eins = select_survivor_eins(conn, args.client_id)
+        counts = run_scoring(args.client_id, eins, haiku_cut_n=args.haiku_cut_n)
+        logger.info("score complete: %s", counts)
         return 0
 
     return 1

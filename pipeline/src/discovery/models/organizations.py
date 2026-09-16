@@ -24,3 +24,8 @@ class Organization(Base):
     revenue_latest: Mapped[int | None] = mapped_column(Numeric)
     foundation_code: Mapped[str | None] = mapped_column(String(2))
     bmf_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # G1.4 addition (not in the brief's §3 sketch): the 990's own Item 5 "Website
+    # address" disclosure, extracted alongside mission/program text in Stage 2. A
+    # citable homepage link for the dashboard only — never fetched, never a scoring
+    # input (§4 Stage 3 uses 990 mission/program text only; see STATUS.md).
+    website: Mapped[str | None] = mapped_column(String(500))

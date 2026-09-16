@@ -70,6 +70,14 @@ resource job 'Microsoft.App/jobs@2023-05-01' = {
           keyVaultUrl: '${keyVaultExisting.properties.vaultUri}secrets/db-connection-string'
           identity: identity.id
         }
+        {
+          // Secret name in Key Vault is appadino-discoveryAI-key, not anthropic-api-key
+          // — added under that name by the operator; docs/code reference it as-is
+          // rather than requiring a rename (see STATUS.md, G1.4).
+          name: 'anthropic-api-key'
+          keyVaultUrl: '${keyVaultExisting.properties.vaultUri}secrets/appadino-discoveryAI-key'
+          identity: identity.id
+        }
       ]
     }
     template: {
@@ -81,6 +89,10 @@ resource job 'Microsoft.App/jobs@2023-05-01' = {
             {
               name: 'DATABASE_URL'
               secretRef: 'database-url'
+            }
+            {
+              name: 'ANTHROPIC_API_KEY'
+              secretRef: 'anthropic-api-key'
             }
           ]
           resources: {

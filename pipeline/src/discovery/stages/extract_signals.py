@@ -43,6 +43,10 @@ AMOUNT_FIELD_TAGS: dict[str, tuple[str, ...]] = {
 # about Part VII job titles, not a client-tunable ICP criterion.
 DEVELOPMENT_TITLE_KEYWORDS = ("development", "fundraising", "advancement")
 
+# Confirmed against real filings: WebsiteAddressTxt (Item 5 disclosure) frequently
+# holds a placeholder rather than an actual site — filtered out rather than stored.
+WEBSITE_PLACEHOLDER_VALUES = frozenset({"NONE", "N/A", "NA", "NONE.", "N.A.", "-"})
+
 
 def _strip_namespaces(elem: ET.Element) -> None:
     for e in elem.iter():
@@ -63,6 +67,48 @@ def _find_amount(scope: ET.Element | None, tags: tuple[str, ...]) -> int | None:
     return None
 
 
+def _extract_program_text(irs990: ET.Element) -> list[dict[str, Any]]:
+    """The numbered Part III program-service accomplishments. Program 1's desc/$
+    fields are unwrapped direct children of IRS990 (confirmed against a real filing —
+    see tests/stages/fixtures/sample_990.xml); programs 2-4 are each in their own
+    ProgSrvcAccomActy{n}Grp wrapper."""
+    programs: list[dict[str, Any]] = []
+    first_desc = irs990.findtext("Desc")
+    if first_desc:
+        programs.append(
+            {
+                "desc": first_desc,
+                "expense": _find_amount(irs990, ("ExpenseAmt",)),
+                "revenue": _find_amount(irs990, ("RevenueAmt",)),
+            }
+        )
+    for n in (2, 3, 4):
+        grp = irs990.find(f"ProgSrvcAccomActy{n}Grp")
+        if grp is None:
+            continue
+        desc = grp.findtext("Desc")
+        if not desc:
+            continue
+        programs.append(
+            {
+                "desc": desc,
+                "expense": _find_amount(grp, ("ExpenseAmt",)),
+                "revenue": _find_amount(grp, ("RevenueAmt",)),
+            }
+        )
+    return programs
+
+
+def _extract_website(irs990: ET.Element) -> str | None:
+    text = irs990.findtext("WebsiteAddressTxt")
+    if text is None:
+        return None
+    text = text.strip()
+    if not text or text.upper() in WEBSITE_PLACEHOLDER_VALUES:
+        return None
+    return text
+
+
 def parse_990_xml(xml_bytes: bytes) -> dict[str, Any]:
     """Best-effort extraction from a single 990 e-file XML document. Never raises on
     missing fields — only on bytes that aren't parseable XML at all.
@@ -74,6 +120,10 @@ def parse_990_xml(xml_bytes: bytes) -> dict[str, Any]:
         "govt_grants": None,
         "fundraising_expense": None,
         "officers": [],
+        "mission_text": None,
+        "program_text": [],
+        "website": None,
+        "significant_change_ind": None,
     }
 
     root = ET.fromstring(xml_bytes)
@@ -110,6 +160,11 @@ def parse_990_xml(xml_bytes: bytes) -> dict[str, Any]:
             }
         )
 
+    significant_change_text = irs990.findtext("SignificantChangeInd")
+    significant_change_ind = (
+        significant_change_text.strip().lower() == "true" if significant_change_text is not None else None
+    )
+
     return {
         "revenue_total": _find_amount(irs990, AMOUNT_FIELD_TAGS["revenue_total"]),
         "contributions": _find_amount(irs990, AMOUNT_FIELD_TAGS["contributions"]),
@@ -117,6 +172,10 @@ def parse_990_xml(xml_bytes: bytes) -> dict[str, Any]:
         "govt_grants": _find_amount(irs990, AMOUNT_FIELD_TAGS["govt_grants"]),
         "fundraising_expense": fundraising_expense,
         "officers": officers,
+        "mission_text": irs990.findtext("MissionDesc") or irs990.findtext("ActivityOrMissionDesc"),
+        "program_text": _extract_program_text(irs990),
+        "website": _extract_website(irs990),
+        "significant_change_ind": significant_change_ind,
     }
 
 
@@ -248,16 +307,28 @@ def _update_filing(conn: psycopg.Connection, filing_id: int, parsed: dict[str, A
                 govt_grants = %(govt_grants)s,
                 fundraising_expense = %(fundraising_expense)s,
                 officers = %(officers)s,
+                mission_text = %(mission_text)s,
+                program_text = %(program_text)s,
+                significant_change_ind = %(significant_change_ind)s,
                 extracted_at = %(extracted_at)s
             WHERE id = %(id)s
             """,
             {
                 **parsed,
                 "officers": Json(parsed["officers"]),
+                "program_text": Json(parsed["program_text"]),
                 "extracted_at": datetime.now(UTC),
                 "id": filing_id,
             },
         )
+    conn.commit()
+
+
+def _update_organization_website(conn: psycopg.Connection, ein: str, website: str | None) -> None:
+    if website is None:
+        return
+    with conn.cursor() as cur:
+        cur.execute("UPDATE organizations SET website = %s WHERE ein = %s", (website, ein))
     conn.commit()
 
 
@@ -307,6 +378,7 @@ def extract_signals_for_survivors(database_url: str, eins: Iterable[str]) -> dic
             filing_rows = cur.fetchall()
 
         parsed_by_ein: dict[str, list[dict[str, Any]]] = {}
+        website_backfilled: set[str] = set()
         for filing_id, ein, tax_year, object_id, xml_object_url in filing_rows:
             year = _year_from_archive_url(xml_object_url)
             if year is None:
@@ -335,6 +407,12 @@ def extract_signals_for_survivors(database_url: str, eins: Iterable[str]) -> dic
             _update_filing(conn, filing_id, parsed)
             counts["filings_parsed"] += 1
             parsed_by_ein.setdefault(ein, []).append({**parsed, "tax_year": tax_year})
+
+            # Rows arrive ordered ein, tax_year DESC — the first hit per ein is
+            # already the most recent filing, so only that one backfills the website.
+            if ein not in website_backfilled:
+                _update_organization_website(conn, ein, parsed["website"])
+                website_backfilled.add(ein)
 
         for ein, filings in parsed_by_ein.items():
             filings.sort(key=lambda f: f["tax_year"], reverse=True)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Integer, Numeric, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -38,4 +38,14 @@ class Filing(Base):
     govt_grants: Mapped[int | None] = mapped_column(Numeric)
     fundraising_expense: Mapped[int | None] = mapped_column(Numeric)
     officers: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # G1.4 additions (not in the brief's §3 sketch): the sole text source for Stage 3
+    # scoring (§4) is 990 Part III narrative text, not a fetched website — see
+    # STATUS.md for why. mission_text = MissionDesc/ActivityOrMissionDesc;
+    # program_text = the numbered ProgSrvcAccomActy*Grp entries (desc + $ amounts,
+    # each independently citable); significant_change_ind mirrors the filing's own
+    # Schedule O "significant change" disclosure, used as evidence for the
+    # "at an inflection point" alignment criterion rather than an LLM guess.
+    mission_text: Mapped[str | None] = mapped_column(Text)
+    program_text: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
+    significant_change_ind: Mapped[bool | None] = mapped_column(Boolean)
     extracted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
