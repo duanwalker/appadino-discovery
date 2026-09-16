@@ -37,13 +37,16 @@ VALUES_SIGNAL_KEYS = (
 
 # 3-of-7 strategic alignment framework (Lauren's ICP spec, not carried into the
 # implementation brief — provided directly by Duan during G1.4). Criterion 2
-# ("potential GENESIS hiring partner") is excluded from scoring per Duan's explicit
-# instruction: GENESIS is a Track A-specific ARCHITECT service, Discovery is
+# ("potential GENESIS hiring partner") is EXCLUDED PENDING CONFIRMATION, not
+# permanently dropped: GENESIS is a Track A-specific ARCHITECT service, Discovery is
 # confirmed Track B-only, and there's no reliable public evidence to score it against
 # without risking fabricated rationale. Unconfirmed with Lauren — flagged for the
-# Sept 16 scoping call. Threshold is therefore 3-of-6 over the remaining criteria.
+# Sept 16 scoping call; may be reinstated once real evidence sourcing exists.
+# Threshold is therefore 3-of-6 over the remaining criteria in the meantime.
 ALIGNMENT_CRITERIA: tuple[dict[str, str], ...] = (
     {"id": "1", "key": "priority_tier_metro", "label": "In a priority-tier metro (Charlotte or Cincinnati)"},
+    # id "2" (potential GENESIS hiring partner) intentionally omitted — excluded
+    # pending confirmation, not forgotten. See the module-level comment above for why.
     {"id": "3", "key": "leadership_advances_equity", "label": "Leadership advances equity mission"},
     {"id": "4", "key": "mission_alignment", "label": "Mission alignment (community-centered, social equity)"},
     {"id": "5", "key": "case_study_potential", "label": "Case-study potential"},
@@ -210,6 +213,17 @@ def build_haiku_request(ein: str, org: dict[str, Any], alignment_keywords: list[
     )
 
 
+def clamp_pre_score(value: int) -> int:
+    """Same missing schema-level guarantee as values_signals scores (see
+    enforce_hard_rules), but pre_score is only a ranking heuristic used to cut to the
+    top N before Sonnet — not persisted as an evidentiary claim about the
+    organization — so an out-of-range value is clamped rather than nulled: nulling
+    would break the sort, and a value the model pushed past 100 or below 0 almost
+    certainly means "very confident" at that extreme rather than a meaningless number.
+    """
+    return max(0, min(100, value))
+
+
 def build_sonnet_request(ein: str, org: dict[str, Any]) -> Request:
     context = build_org_context(org)
     criteria_desc = "\n".join(
@@ -298,6 +312,20 @@ def enforce_hard_rules(
         if any(phrase in rationale for phrase in FORBIDDEN_PHRASES):
             violations.append(f"values_signals.{key}: forbidden phrase in rationale, redacted")
             sig["rationale"] = "[redacted: contained a disallowed phrase]"
+
+        # output_config.format's JSON schema can't constrain integer ranges (confirmed
+        # via a live 400 — see HAIKU_OUTPUT_SCHEMA), so the 0-100 range is only a
+        # system-prompt instruction at request time, not a mechanical guarantee. This
+        # is the code-level backstop: an out-of-range score is nulled, not clamped —
+        # clamping would insert a value the model never actually returned, which is
+        # exactly the kind of fabricated-looking number §9 rule 3's "blank beats
+        # wrong" principle rules out for evidentiary judgments (unlike Haiku's
+        # pre_score, which is only a ranking heuristic — see clamp_pre_score).
+        score = sig.get("score")
+        if score is not None and not (isinstance(score, int) and 0 <= score <= 100):
+            violations.append(f"values_signals.{key}: score {score!r} out of [0,100] range, nulled")
+            sig["score"] = None
+            sig["needs_human_verification"] = True
 
     for key, crit in criteria.items():
         if not isinstance(crit, dict):

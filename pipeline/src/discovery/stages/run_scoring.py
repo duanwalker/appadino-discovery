@@ -20,6 +20,7 @@ from discovery.stages.score import (
     assemble_alignment,
     build_haiku_request,
     build_sonnet_request,
+    clamp_pre_score,
     compute_capacity,
     compute_priority_tier_metro,
     compute_soft_flags,
@@ -156,6 +157,20 @@ def run_scoring(
         haiku_results = run_batch(anthropic_client, haiku_requests)
         counts["haiku_succeeded"] = sum(1 for v in haiku_results.values() if v is not None)
         counts["haiku_failed"] = sum(1 for v in haiku_results.values() if v is None)
+
+        # Same missing schema-level range guarantee as Sonnet's values_signals scores
+        # (see enforce_hard_rules) — clamp here rather than null, since pre_score
+        # drives the top-N cut below and must stay a usable sort key.
+        counts["pre_score_out_of_range"] = 0
+        for ein, result in haiku_results.items():
+            if result is None:
+                continue
+            raw_pre_score = result["pre_score"]
+            clamped = clamp_pre_score(raw_pre_score)
+            if clamped != raw_pre_score:
+                counts["pre_score_out_of_range"] += 1
+                logger.warning("ein=%s pre_score %r out of [0,100], clamped to %r", ein, raw_pre_score, clamped)
+                result["pre_score"] = clamped
 
         with psycopg.connect(database_url) as conn:
             for ein, result in haiku_results.items():

@@ -6,6 +6,7 @@ from discovery.stages.score import (
     CAPACITY_NOTE,
     assemble_alignment,
     build_org_context,
+    clamp_pre_score,
     compute_capacity,
     compute_priority_tier_metro,
     compute_soft_flags,
@@ -109,6 +110,82 @@ class TestRule2NeverFullyQualified:
         sanitized, _, violations = enforce_hard_rules(values_signals, {})
         assert sanitized["mission_language"]["rationale"] == values_signals["mission_language"]["rationale"]
         assert violations == []
+
+
+class TestScoreRangeEnforcement:
+    """output_config.format's JSON schema can't constrain integer ranges (confirmed
+    via a live 400), so the 0-100 range on scores is only a system-prompt instruction
+    at request time, not a mechanical guarantee. These test the code-level backstop —
+    without it, an out-of-range score would silently reach the DB and skew any
+    downstream ranking (e.g. G1.5's gap_rank) built on these values."""
+
+    def test_score_above_100_is_nulled_not_clamped(self) -> None:
+        values_signals = {
+            "programming": {
+                "score": 150,
+                "rationale": "Extremely strong program alignment.",
+                "citation": "program_text[0].desc",
+                "needs_human_verification": False,
+            }
+        }
+        sanitized, _, violations = enforce_hard_rules(values_signals, {})
+        assert sanitized["programming"]["score"] is None
+        assert sanitized["programming"]["needs_human_verification"] is True
+        assert len(violations) == 1
+        assert "out of [0,100] range" in violations[0]
+
+    def test_negative_score_is_nulled(self) -> None:
+        values_signals = {
+            "funder_base": {
+                "score": -5,
+                "rationale": "x",
+                "citation": "y",
+                "needs_human_verification": False,
+            }
+        }
+        sanitized, _, violations = enforce_hard_rules(values_signals, {})
+        assert sanitized["funder_base"]["score"] is None
+        assert sanitized["funder_base"]["needs_human_verification"] is True
+        assert len(violations) == 1
+
+    def test_boundary_values_are_valid(self) -> None:
+        values_signals = {
+            "programming": {"score": 0, "rationale": "x", "citation": "y", "needs_human_verification": False},
+            "funder_base": {"score": 100, "rationale": "x", "citation": "y", "needs_human_verification": False},
+        }
+        sanitized, _, violations = enforce_hard_rules(values_signals, {})
+        assert sanitized["programming"]["score"] == 0
+        assert sanitized["funder_base"]["score"] == 100
+        assert violations == []
+
+    def test_null_score_is_untouched(self) -> None:
+        values_signals = {
+            "population_served": {
+                "score": None,
+                "rationale": "No evidence provided.",
+                "citation": None,
+                "needs_human_verification": True,
+            }
+        }
+        _, _, violations = enforce_hard_rules(values_signals, {})
+        assert violations == []
+
+
+class TestClampPreScore:
+    """Haiku's pre_score has the same missing schema guarantee, but it's a ranking
+    heuristic (used to cut to the top N before Sonnet), not a persisted evidentiary
+    claim — clamped rather than nulled, since nulling would break the sort."""
+
+    def test_within_range_untouched(self) -> None:
+        assert clamp_pre_score(50) == 50
+        assert clamp_pre_score(0) == 0
+        assert clamp_pre_score(100) == 100
+
+    def test_above_100_clamped_to_100(self) -> None:
+        assert clamp_pre_score(150) == 100
+
+    def test_below_0_clamped_to_0(self) -> None:
+        assert clamp_pre_score(-20) == 0
 
 
 class TestRule6NteeNeverInScoringInputs:
