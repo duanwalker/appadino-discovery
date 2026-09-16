@@ -245,6 +245,7 @@ def run_scoring(
     except Exception as exc:
         status = "failed"
         error = str(exc)
+        logger.exception("RUN_FAILED stage=scoring client_id=%s error=%s", client_id, error)
         raise
     finally:
         finished_at = datetime.now(UTC)
@@ -255,5 +256,8 @@ def run_scoring(
                     (finished_at, status, Json(counts), error, run_id),
                 )
             conn.commit()
+
+    if status == "success" and counts.get("scoreable", 0) > 0 and counts.get("sonnet_succeeded") == 0:
+        logger.warning("ZERO_OUTPUT_RUN stage=scoring client_id=%s counts=%s", client_id, counts)
 
     return counts

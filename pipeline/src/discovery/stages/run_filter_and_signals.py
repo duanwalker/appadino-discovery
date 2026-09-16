@@ -52,6 +52,7 @@ def run_filter_and_signals(client_id: int, database_url: str | None = None) -> d
     except Exception as exc:
         status = "failed"
         error = str(exc)
+        logger.exception("RUN_FAILED stage=filter_and_signals client_id=%s error=%s", client_id, error)
         raise
     finally:
         finished_at = datetime.now(UTC)
@@ -62,5 +63,8 @@ def run_filter_and_signals(client_id: int, database_url: str | None = None) -> d
                     (finished_at, status, Json(counts), error, run_id),
                 )
             conn.commit()
+
+    if status == "success" and counts.get("survivors") == 0:
+        logger.warning("ZERO_OUTPUT_RUN stage=filter_and_signals client_id=%s counts=%s", client_id, counts)
 
     return counts

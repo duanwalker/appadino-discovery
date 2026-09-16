@@ -36,6 +36,8 @@ is supplied only at deploy time.
 | `adisc-dev-ai` | Application Insights, wired to the same Log Analytics workspace |
 | `adiscdevacr` | Container Registry (Basic), holds the `discovery-pipeline` image |
 | `adisc-dev-pipeline-job` | Container Apps Job, monthly cron. Runs `adiscdevacr.azurecr.io/discovery-pipeline:latest` — Stage 0 ingest (§4) as of G1.2 |
+| `adisc-dev-ops-ag` | Action group — email alert notifications (§7) |
+| `adisc-dev-run-failed-alert` / `adisc-dev-zero-output-alert` / `adisc-dev-qa-mismatch-alert` | Scheduled query rules (G1.5) watching `ContainerAppConsoleLogs_CL` (confirmed against real pipeline logs) for the `RUN_FAILED`/`ZERO_OUTPUT_RUN`/`QA_MISMATCH_RATE_EXCEEDED` markers each orchestrator logs. §7's third alert category, cost anomalies, isn't implemented — no historical cost baseline exists yet to detect an anomaly against (flagged in STATUS.md) |
 
 The job's user-assigned managed identity has `Key Vault Secrets User` on the vault and `AcrPull` on
 the registry; no secrets are passed as plaintext environment variables — `DATABASE_URL` is a

@@ -86,6 +86,29 @@ prompt-level, enforcement of §9 rules 1 (no demographic inference) and 2 (never
 The Anthropic key in Key Vault is named `appadino-discoveryAI-key`, not `anthropic-api-key` — code
 and docs reference it as-is.
 
+### Suppress + triggers + publish + QA (Stages 4-6, §4, §7)
+
+```powershell
+./.venv/Scripts/python -m discovery.cli publish <client_id>
+```
+
+Stage 4 excludes EIN-exact suppression matches outright; fuzzy name matches (against ARCHITECT's
+seed list, §4 Stage 4) are flagged in `prospects.notes`, never silently dropped (§9 rule 7). Stage 5
+diffs each survivor's latest vs. prior filing for the 4 filing-derived triggers; the trigger→angle
+mapping is read from `icp_configs.config.trigger_angles` and stays `null` when the brief doesn't
+give one (e.g. `first_filing_above_floor`) rather than inventing text. Stage 6 upserts `prospects`
+for every non-disqualified, non-suppressed, Sonnet-scored survivor, computes `gap_rank` (a
+first-pass, config-weighted formula — see STATUS.md for a real consequence of the default weights
+worth knowing about), and writes a CSV to `pipeline/output/` (gitignored — no blob storage
+provisioned yet). The QA job then samples up to 20 cited claims and re-verifies each against our own
+stored source data (`discovery.stages.qa.verify_claim`); a mismatch rate over 10% logs a
+`QA_MISMATCH_RATE_EXCEEDED` marker.
+
+Every orchestrator (`ingest`, `filter`, `score`, `publish`) now logs `RUN_FAILED`/`ZERO_OUTPUT_RUN`
+markers to stdout on the relevant condition — picked up by 3 Azure Monitor scheduled query rules
+(§7) watching the Container Apps environment's `ContainerAppConsoleLogs_CL` table, emailing the
+operator via the `adisc-dev-ops-ag` action group.
+
 ## Tests
 
 ```powershell
@@ -95,8 +118,9 @@ and docs reference it as-is.
 ```
 
 Tests exercise pure functions only (`transform_bmf_row`, `transform_index_row`,
-`latest_two_per_ein`, `build_survivor_query`, `parse_990_xml`, `compute_signals`) with fixture
-data — they don't hit the network or a live database, so they run in CI unchanged.
+`latest_two_per_ein`, `build_survivor_query`, `parse_990_xml`, `compute_signals`,
+`enforce_hard_rules`, `detect_triggers`, `compute_gap_rank`, `verify_claim`, `find_fuzzy_match`)
+with fixture data — they don't hit the network or a live database, so they run in CI unchanged.
 `tests/stages/fixtures/sample_990.xml` is a real filing fetched during G1.3 to ground the XML
 field-mapping tests in actual IRS data rather than schema docs alone.
 

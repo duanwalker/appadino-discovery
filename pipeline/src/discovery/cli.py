@@ -20,6 +20,10 @@ def main(argv: list[str] | None = None) -> int:
     score_parser.add_argument(
         "--haiku-cut-n", type=int, default=None, help="Override the Haiku-to-Sonnet cut size (config default: 3000)"
     )
+    publish_parser = subparsers.add_parser(
+        "publish", help="Run Stages 4-6 + QA — suppress, detect triggers, publish prospects for a client"
+    )
+    publish_parser.add_argument("client_id", type=int)
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -50,6 +54,13 @@ def main(argv: list[str] | None = None) -> int:
             eins = select_survivor_eins(conn, args.client_id)
         counts = run_scoring(args.client_id, eins, haiku_cut_n=args.haiku_cut_n)
         logger.info("score complete: %s", counts)
+        return 0
+
+    if args.command == "publish":
+        from discovery.stages.run_publish import run_publish
+
+        counts = run_publish(args.client_id)
+        logger.info("publish complete: %s", counts)
         return 0
 
     return 1

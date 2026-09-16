@@ -330,6 +330,7 @@ def run_ingest(database_url: str | None = None, years: list[int] | None = None) 
     except Exception as exc:
         status = "failed"
         error = str(exc)
+        logger.exception("RUN_FAILED stage=ingest error=%s", error)
         raise
     finally:
         finished_at = datetime.now(UTC)
@@ -340,5 +341,8 @@ def run_ingest(database_url: str | None = None, years: list[int] | None = None) 
                     (finished_at, status, Json(counts), error, run_id),
                 )
             conn.commit()
+
+    if status == "success" and (counts.get("organizations") == 0 or counts.get("filings") == 0):
+        logger.warning("ZERO_OUTPUT_RUN stage=ingest counts=%s", counts)
 
     return counts

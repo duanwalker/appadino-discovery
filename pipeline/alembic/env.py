@@ -12,9 +12,12 @@ from discovery.models import (  # noqa: F401 — registers metadata
     Filing,
     IcpConfig,
     Organization,
+    Prospect,
+    QaSample,
     Run,
     Score,
     Signal,
+    Suppression,
 )
 
 config = context.config

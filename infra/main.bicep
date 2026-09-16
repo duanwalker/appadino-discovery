@@ -19,6 +19,9 @@ param keyVaultAdminPrincipalId string
 @description('Tag of the discovery-pipeline image to run in the Container Apps Job')
 param pipelineImageTag string = 'latest'
 
+@description('Email address for pipeline run-failure/zero-output/QA-mismatch alerts (§7)')
+param alertEmail string
+
 var keyVaultSecretsOfficerRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b86a8fe4-44ce-4948-aee5-eccb2c155cd7')
 // Computed directly (not from the module output) so it's resolvable at the start of
 // deployment — required for use in role-assignment name/scope and secret parent below.
@@ -66,6 +69,16 @@ module acr 'modules/acr.bicep' = {
   params: {
     location: location
     namePrefix: acrNamePrefix
+  }
+}
+
+module alerts 'modules/alerts.bicep' = {
+  name: 'alerts'
+  params: {
+    location: location
+    namePrefix: namePrefix
+    logAnalyticsWorkspaceId: containerAppsEnv.outputs.logAnalyticsId
+    alertEmail: alertEmail
   }
 }
 
