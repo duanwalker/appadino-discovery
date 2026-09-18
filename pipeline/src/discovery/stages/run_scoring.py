@@ -25,6 +25,7 @@ from discovery.stages.score import (
     compute_priority_tier_metro,
     compute_soft_flags,
     enforce_hard_rules,
+    redact_dq_reason,
     run_batch,
 )
 
@@ -200,7 +201,13 @@ def run_scoring(
             for ein in orgs
             if haiku_results.get(ein) is not None and not haiku_results[ein]["obvious_disqualifier"]
         ]
-        candidates.sort(key=lambda pair: pair[1], reverse=True)
+        # Deterministic secondary sort key (G1.4 coverage-review Gap 5): ties at the
+        # cut threshold previously depended on incidental DB/dict insertion order —
+        # `_load_scoreable_orgs()` has no explicit ORDER BY. EIN is a unique,
+        # stable per-org identifier, so sorting descending pre_score then ascending
+        # EIN makes the top-N cut fully deterministic regardless of load order —
+        # re-runs on the same data always produce the same Sonnet candidate set.
+        candidates.sort(key=lambda pair: (-pair[1], pair[0]))
         sonnet_eins = [ein for ein, _ in candidates[:cut_n]]
         counts["sonnet_candidates"] = len(sonnet_eins)
 
@@ -211,14 +218,48 @@ def run_scoring(
         counts["sonnet_failed"] = sum(1 for v in sonnet_results.values() if v is None)
         counts["hard_rule_violations"] = 0
 
+        counts["sonnet_persisted_as_failed"] = 0
         with psycopg.connect(database_url) as conn:
             for ein, result in sonnet_results.items():
-                if result is None:
-                    continue
                 org = orgs[ein]
+                if result is None:
+                    # G1.4 coverage-review Gap 6: a batch item that errored/expired/
+                    # was canceled (see run_batch's docstring) previously left no row
+                    # at all for this (client_id, ein, icp_version, stage='sonnet')
+                    # key — indistinguishable from "never selected for Sonnet in the
+                    # first place" without cross-referencing this run's aggregate
+                    # counts/logs. A placeholder row makes the failure durable and
+                    # queryable per-EIN (values_signals/alignment NULL, distinct from
+                    # every successful row); load_publishable() excludes alignment IS
+                    # NULL rows so it's never mistaken for a publishable score, and
+                    # re-scoring this EIN later overwrites it via the existing
+                    # ON CONFLICT upsert once the item succeeds — recoverable, not a
+                    # dead end.
+                    counts["sonnet_persisted_as_failed"] += 1
+                    _insert_score(
+                        conn,
+                        {
+                            "client_id": client_id,
+                            "ein": ein,
+                            "icp_version": icp_version,
+                            "stage": "sonnet",
+                            "values_signals": None,
+                            "alignment": None,
+                            "capacity": compute_capacity(org.get("dd_present"), org.get("fundraising_spend_ratio")),
+                            "disqualified": False,
+                            "dq_reason": None,
+                            "soft_flags": compute_soft_flags(org.get("gov_funding_pct"), govt_funding_heavy_pct),
+                            "scored_at": datetime.now(UTC),
+                        },
+                    )
+                    continue
+
                 values_signals, model_criteria, violations = enforce_hard_rules(
-                    result["values_signals"], result["alignment_criteria"]
+                    result["values_signals"], result["alignment_criteria"], org_context=org
                 )
+                dq_reason, dq_redacted = redact_dq_reason(result["dq_reason"])
+                if dq_redacted:
+                    violations.append("dq_reason: forbidden phrase in disqualification reason, redacted")
                 counts["hard_rule_violations"] += len(violations)
                 if violations:
                     logger.warning("hard-rule violations for ein=%s: %s", ein, violations)
@@ -237,7 +278,7 @@ def run_scoring(
                         "alignment": alignment,
                         "capacity": compute_capacity(org.get("dd_present"), org.get("fundraising_spend_ratio")),
                         "disqualified": result["disqualified"],
-                        "dq_reason": result["dq_reason"],
+                        "dq_reason": dq_reason,
                         "soft_flags": compute_soft_flags(org.get("gov_funding_pct"), govt_funding_heavy_pct),
                         "scored_at": datetime.now(UTC),
                     },

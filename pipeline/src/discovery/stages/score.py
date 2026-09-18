@@ -20,6 +20,8 @@ import anthropic
 from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
 from anthropic.types.messages.batch_create_params import Request
 
+from discovery.stages.qa import _program_text_corpus, _quoted_text_matches_corpus, verify_claim
+
 logger = logging.getLogger(__name__)
 
 HAIKU_MODEL = "claude-haiku-4-5"
@@ -283,27 +285,82 @@ def run_batch(client: anthropic.Anthropic, requests: list[Request], poll_interva
     return results
 
 
+def _flatten_org_context(org_context: dict[str, Any]) -> dict[str, Any]:
+    """Same flattening run_publish.py applies before QA's verify_claim() — nested
+    revenue_composition fields (govt_pct/program_pct/contributions_pct) are cited by
+    their bare name (§9 rule 4's own example: "govt_pct 0.59 from 990 filing data"),
+    so they need to be promoted to top level for verify_claim's field-pointer regexes
+    to find them."""
+    return {**org_context, **(org_context.get("revenue_composition") or {})}
+
+
+def _citation_is_published_self_description(citation: Any, org_context: dict[str, Any]) -> bool:
+    """§9 rule 1's specific bar for leadership_composition: only an explicit,
+    published self-description in the org's own mission/program text counts — never
+    a numeric/categorical field pointer (unlike the other four signals, identity
+    self-description isn't the kind of claim a financial signal can support).
+    Deliberately bypasses verify_claim()'s TEXT_FIELD_POINTERS shortcut (which
+    matches "mission_text: ..." citations merely because mission_text is non-empty,
+    without checking the quoted content is real) — that shortcut is exactly the
+    demographic-inference-with-an-unrelated-citation gap this guard exists to close,
+    so leadership citations are checked against the real corpus text directly."""
+    if not isinstance(citation, str) or not citation.strip():
+        return False
+    corpus = f"{org_context.get('mission_text') or ''} {_program_text_corpus(org_context.get('program_text'))}"
+    return _quoted_text_matches_corpus(citation, corpus)
+
+
+def _citation_supports_claim(citation: Any, org_context: dict[str, Any]) -> bool:
+    """§9 rule 4's general citation-grounding check for the other four values
+    signals and every alignment criterion: reuses the same verification the QA job
+    runs at sample-time (discovery.stages.qa.verify_claim) — a citation counts only
+    if it's a verified match against the org's own stored numeric/boolean/
+    categorical signals or mission/program text, not merely present."""
+    if not isinstance(citation, str) or not citation.strip():
+        return False
+    return verify_claim(citation, org_context) == "match"
+
+
 def enforce_hard_rules(
-    values_signals: dict[str, Any], alignment_criteria: dict[str, Any]
+    values_signals: dict[str, Any],
+    alignment_criteria: dict[str, Any],
+    org_context: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
-    """Defense-in-depth enforcement of §9 rules 1 and 2 — independent of the system
-    prompt, applied to every Sonnet response before it's persisted. Returns
+    """Defense-in-depth enforcement of §9 rules 1, 2, and 4 — independent of the
+    system prompt, applied to every Sonnet response before it's persisted. Returns
     (sanitized_values_signals, sanitized_alignment_criteria, violations_found).
+
+    `org_context` (the same org dict passed to build_sonnet_request — mission_text/
+    program_text/derived signals) is required to actually verify a citation is
+    grounded (rule 1's "explicit published self-description" bar for
+    leadership_composition, rule 4's "citation must support the claim" bar for
+    everything else). `run_scoring.run_scoring()` always supplies it. Omitting it
+    (the default, None) skips grounding verification entirely and falls back to the
+    pre-fix structural-only checks (citation present/absent) — this exists so tests
+    of the *other* hard rules (score range, forbidden-phrase redaction, GENESIS
+    math) don't need to fabricate a matching corpus fixture; it is not a production
+    code path.
     """
     violations: list[str] = []
     signals = json.loads(json.dumps(values_signals))  # deep copy without importing copy
     criteria = json.loads(json.dumps(alignment_criteria))
+    context = _flatten_org_context(org_context) if org_context is not None else None
 
     leadership = signals.get("leadership_composition")
-    if (
-        leadership
-        and leadership.get("score") is not None
-        and not leadership.get("citation")
-        and not leadership.get("needs_human_verification")
-    ):
-        violations.append("leadership_composition: score with no citation and no needs_human_verification")
-        leadership["score"] = None
-        leadership["needs_human_verification"] = True
+    if leadership and leadership.get("score") is not None and not leadership.get("needs_human_verification"):
+        if context is not None:
+            grounded = _citation_is_published_self_description(leadership.get("citation"), context)
+            violation_msg = (
+                "leadership_composition: score not backed by a citation verified against the org's own "
+                "published self-description, forced to needs_human_verification"
+            )
+        else:
+            grounded = bool(leadership.get("citation"))
+            violation_msg = "leadership_composition: score with no citation and no needs_human_verification"
+        if not grounded:
+            violations.append(violation_msg)
+            leadership["score"] = None
+            leadership["needs_human_verification"] = True
 
     for key, sig in signals.items():
         if not isinstance(sig, dict):
@@ -327,6 +384,20 @@ def enforce_hard_rules(
             sig["score"] = None
             sig["needs_human_verification"] = True
 
+        if (
+            context is not None
+            and key != "leadership_composition"
+            and sig.get("score") is not None
+            and not sig.get("needs_human_verification")
+            and not _citation_supports_claim(sig.get("citation"), context)
+        ):
+            violations.append(
+                f"values_signals.{key}: score not backed by a citation verified against the org's own "
+                "stored source data, forced to needs_human_verification"
+            )
+            sig["score"] = None
+            sig["needs_human_verification"] = True
+
     for key, crit in criteria.items():
         if not isinstance(crit, dict):
             continue
@@ -335,7 +406,28 @@ def enforce_hard_rules(
             violations.append(f"alignment_criteria.{key}: forbidden phrase in rationale, redacted")
             crit["rationale"] = "[redacted: contained a disallowed phrase]"
 
+        if context is not None and crit.get("met") and not _citation_supports_claim(crit.get("citation"), context):
+            violations.append(
+                f"alignment_criteria.{key}: met=true not backed by a citation verified against the org's own "
+                "stored source data, forced to met=false"
+            )
+            crit["met"] = False
+
     return signals, criteria, violations
+
+
+def redact_dq_reason(dq_reason: str | None) -> tuple[str | None, bool]:
+    """§9 rule 2's forbidden-phrase ban, extended to dq_reason — enforce_hard_rules
+    only ever received values_signals/alignment_criteria, so a Sonnet response with
+    dq_reason containing "fully qualified" was persisted unchanged (the G1.4 coverage
+    review's Gap 2 finding). A separate function rather than folding into
+    enforce_hard_rules: dq_reason isn't part of either signals/criteria dict shape,
+    and this keeps enforce_hard_rules's return arity stable for its many existing
+    callers. Returns (sanitized_dq_reason, was_redacted).
+    """
+    if dq_reason and any(phrase in dq_reason.lower() for phrase in FORBIDDEN_PHRASES):
+        return "[redacted: contained a disallowed phrase]", True
+    return dq_reason, False
 
 
 def compute_priority_tier_metro(city: str | None, priority_metros: list[str]) -> bool:

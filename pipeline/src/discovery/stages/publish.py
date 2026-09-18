@@ -68,13 +68,17 @@ def compute_gap_rank(
 
 
 def load_publishable(conn: psycopg.Connection, client_id: int, icp_version: int) -> list[dict[str, Any]]:
+    """`alignment IS NOT NULL` excludes run_scoring's batch-partial-failure
+    placeholder rows (stage='sonnet', values_signals/alignment NULL, disqualified
+    default False) — those exist so a failed Sonnet item is durable and queryable,
+    not so it becomes a publishable prospect with no actual score behind it."""
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT sc.ein, sc.alignment, sc.capacity
             FROM scores sc
             WHERE sc.client_id = %s AND sc.icp_version = %s AND sc.stage = 'sonnet'
-                AND sc.disqualified = false
+                AND sc.disqualified = false AND sc.alignment IS NOT NULL
             """,
             (client_id, icp_version),
         )
