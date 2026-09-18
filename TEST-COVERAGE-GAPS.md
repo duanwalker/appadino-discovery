@@ -413,6 +413,16 @@ Output (post-fix, 2026-09-18): **37 passed** (`test_g14_llm_guard_gaps.py`, up f
 
 ## G1.3 Filters + Signals — Independent Test Coverage Review
 
+## Resolution (2026-09-18)
+
+All three flagged gaps were fixed, in priority order (all three lower severity than the G1.4 items, batched after those):
+
+- **`coverage_pct` denominator (Gap 11)** — `extract_signals_for_survivors()`'s `coverage_pct` is now `signals_computed / len(eins)` (Stage 1's survivor count), not `filings_parsed / (filings_parsed + filings_failed)`. A survivor with zero filing rows at all previously never appeared on either side of the old ratio, so the metric could read as complete even when real Stage 1 survivors were never parsed at all; it now correctly drags the percentage down. Numerator is `signals_computed` (the actual survivor-level success — an EIN whose first filing fails but second filing parses still gets a computed signal), not `filings_parsed`, since the goal is measuring survivor coverage, not filing-attempt success.
+- **Development-role title abbreviations (Gap 8)** — a new `_title_indicates_development_role()` helper adds word-boundary matching (`\bdev\b`) for the abbreviation `"dev"` alongside the existing full-word substring keywords (`development`/`fundraising`/`advancement`). "VP Dev" — the real near-miss this review found — is now detected. Word-boundary matching, not a bare substring, was deliberately chosen so this doesn't also match unrelated titles like "IT Developer" or "Device Manager" (verified with a dedicated non-regression test). Scoped narrowly to abbreviations, not the separately-flagged "near synonym" roles (`Chief Growth Officer`, `Donor Relations Lead`) — those remain correctly out of scope and still return `dd_present=False`, left open by design per the original gap note.
+- **Government-funding soft-flag rounding (Gap 6)** — `compute_signals()`'s top-level `gov_funding_pct` (the value that feeds `compute_soft_flags()`'s `>=` threshold comparison at Stage 3) is no longer rounded to 4 decimals before that comparison happens. `revenue_composition["govt_pct"]` — a separate copy used for display/citation in Sonnet's prompts — is still rounded, since a clean number is more useful there and it's never itself compared against a threshold. The exact near-miss this review found (399,999 / 1,000,000 = 0.399999, which rounded up to 0.4000 and incorrectly flagged as heavy government funding) now correctly evaluates as below threshold. The threshold itself couldn't move into Stage 2 (where the raw ratio is computed) because it's per-client config (`govt_funding_heavy_pct`) and Stage 2's `signals` table is shared across all clients, keyed by `(ein, tax_year)` only — so the fix keeps the comparison at Stage 3 but stops pre-rounding the value it operates on.
+
+**Full suite: 325/325 passing** (30/30 in `test_g13_filter_signal_gaps.py`, up from 29 — the 3 tests that documented the old buggy behavior were updated to assert the fix, plus one new non-regression test confirming the abbreviation match doesn't over-match unrelated titles). Reconciles against the 324-test baseline after the G1.4 follow-up fixes: 324 + 1 net new test = 325. Ruff-clean, `mypy src` clean.
+
 ## Summary
 
 Added **29 pytest cases** in [`pipeline/tests/stages/test_g13_filter_signal_gaps.py`](pipeline/tests/stages/test_g13_filter_signal_gaps.py) covering the actual G1.3 implementation: Stage 1 recall filtering in `filter.py`, Stage 2 990 XML parsing/signal extraction in `extract_signals.py`, the G1.3 runner in `run_filter_and_signals.py`/`extract_signals_for_survivors()`, and the downstream Stage 5 transformational-jump boundary where G1.3's `revenue_trend` signal feeds later trigger logic.
@@ -543,10 +553,10 @@ This review avoids the already-audited foundation-code exclude behavior and focu
 
 | Issue | Severity | Location | Status |
 |-------|----------|----------|--------|
-| `coverage_pct` is filing-based and excludes Stage 1 survivors with no filing rows; it does not measure parsed survivors over total survivors | Medium | `stages/extract_signals.py` `extract_signals_for_survivors()` | ⚠️ Flagged, not fixed |
-| Raw government funding just below 40% can round to `0.4` in `compute_signals()` and later soft-flag as heavy funding | Low | `stages/extract_signals.py` `compute_signals()`, `stages/score.py` `compute_soft_flags()` | ⚠️ Flagged, not fixed |
-| Stage 2 does not persist a distinct ≥50% transformational-jump signal; the boundary is only evaluated later in Stage 5 triggers | Low/design boundary | `stages/extract_signals.py` / `stages/triggers.py` | ℹ️ Noted |
-| Development-role detection misses abbreviations/near synonyms like `VP Dev` and `Donor Relations Lead` | Low | `stages/extract_signals.py` `DEVELOPMENT_TITLE_KEYWORDS` | ℹ️ Noted |
+| `coverage_pct` is filing-based and excludes Stage 1 survivors with no filing rows; it does not measure parsed survivors over total survivors | Medium | `stages/extract_signals.py` `extract_signals_for_survivors()` | ✅ Fixed |
+| Raw government funding just below 40% can round to `0.4` in `compute_signals()` and later soft-flag as heavy funding | Low | `stages/extract_signals.py` `compute_signals()`, `stages/score.py` `compute_soft_flags()` | ✅ Fixed |
+| Stage 2 does not persist a distinct ≥50% transformational-jump signal; the boundary is only evaluated later in Stage 5 triggers | Low/design boundary | `stages/extract_signals.py` / `stages/triggers.py` | ℹ️ Noted — not in this fix's scope |
+| Development-role detection misses abbreviations/near synonyms like `VP Dev` and `Donor Relations Lead` | Low | `stages/extract_signals.py` `DEVELOPMENT_TITLE_KEYWORDS` | ✅ Fixed for abbreviations (`VP Dev`); near-synonyms (`Donor Relations Lead`) left open by design, see Resolution above |
 | NTEE-prefix excludes hardcoded instead of config-driven | Medium if present | `stages/filter.py` `build_survivor_query()` | ✅ No gap found |
 | Revenue floor/ceiling edge inclusivity | Medium if wrong | `stages/filter.py` `build_survivor_query()` | ✅ No gap found |
 | Geography tiers filtering non-priority metros out of Stage 1 | High if present | `stages/filter.py` `build_survivor_query()` | ✅ No gap found |
@@ -560,9 +570,10 @@ This review avoids the already-audited foundation-code exclude behavior and focu
 cd pipeline
 .\.venv\Scripts\Activate.ps1
 python -m pytest tests/stages/test_g13_filter_signal_gaps.py -q
-python -m ruff check tests/stages/test_g13_filter_signal_gaps.py
+python -m ruff check .
+python -m mypy src
 python -m pytest -q
 ```
 
-Output: **29 passed** (new G1.3 file) / **309 passed** (full suite). Baseline reconciliation: **280 existing + 29 new = 309**.
+Output (post-fix, 2026-09-18): **30 passed** (`test_g13_filter_signal_gaps.py`, up from 29) / **325 passed** (full suite, up from the 324-test baseline). Ruff-clean, `mypy src` clean.
 

@@ -43,6 +43,23 @@ AMOUNT_FIELD_TAGS: dict[str, tuple[str, ...]] = {
 # about Part VII job titles, not a client-tunable ICP criterion.
 DEVELOPMENT_TITLE_KEYWORDS = ("development", "fundraising", "advancement")
 
+# Common abbreviations for the keywords above that a plain substring match on the
+# full words misses (e.g. "VP Dev" — a real near-miss, TEST-COVERAGE-GAPS.md G1.3
+# Gap 8). These need word-boundary matching rather than substring search: "dev" as a
+# bare substring would also false-positive on unrelated titles like "IT Developer" or
+# "Device Manager", which the full-word keywords above are specific enough to avoid.
+DEVELOPMENT_TITLE_ABBREVIATIONS = ("dev",)
+_DEVELOPMENT_ABBREVIATION_PATTERN = re.compile(
+    r"\b(?:" + "|".join(re.escape(a) for a in DEVELOPMENT_TITLE_ABBREVIATIONS) + r")\b"
+)
+
+
+def _title_indicates_development_role(title: str | None) -> bool:
+    title_lower = (title or "").lower()
+    if any(keyword in title_lower for keyword in DEVELOPMENT_TITLE_KEYWORDS):
+        return True
+    return bool(_DEVELOPMENT_ABBREVIATION_PATTERN.search(title_lower))
+
 # Confirmed against real filings: WebsiteAddressTxt (Item 5 disclosure) frequently
 # holds a placeholder rather than an actual site — filtered out rather than stored.
 WEBSITE_PLACEHOLDER_VALUES = frozenset({"NONE", "N/A", "NA", "NONE.", "N.A.", "-"})
@@ -207,7 +224,17 @@ def compute_signals(
             else None,
             "govt_pct": round(govt_grants / revenue_total, 4) if govt_grants is not None else None,
         }
-        gov_funding_pct = revenue_composition["govt_pct"]
+        # Deliberately NOT round(..., 4) like revenue_composition["govt_pct"] above
+        # (which exists for display/citation, where a clean 4-decimal number is more
+        # useful to Sonnet than one isn't). This raw value is what later feeds
+        # compute_soft_flags()'s >= govt_funding_heavy_pct comparison (score.py,
+        # Stage 3 — the threshold itself is per-client config, so the comparison
+        # can't happen here in the client-agnostic Stage 2 signal). Rounding first
+        # can push a genuinely-below-threshold ratio across the line — e.g.
+        # 399,999 / 1,000,000 = 0.399999 rounds to 0.4000 at 4 decimals, a real
+        # near-miss TEST-COVERAGE-GAPS.md's G1.3 review found. Compare raw, round
+        # only for display/storage after the threshold decision is made.
+        gov_funding_pct = govt_grants / revenue_total if govt_grants is not None else None
 
     fundraising_spend_ratio = None
     if fundraising_expense is not None and revenue_total:
@@ -215,11 +242,7 @@ def compute_signals(
 
     officers = current.get("officers") or []
     dd_present = (
-        any(
-            keyword in (officer.get("title") or "").lower()
-            for officer in officers
-            for keyword in DEVELOPMENT_TITLE_KEYWORDS
-        )
+        any(_title_indicates_development_role(officer.get("title")) for officer in officers)
         if officers
         else None
     )
@@ -422,10 +445,16 @@ def extract_signals_for_survivors(database_url: str, eins: Iterable[str]) -> dic
             _upsert_signal(conn, ein, current["tax_year"], signal)
             counts["signals_computed"] += 1
 
-    total = counts["filings_parsed"] + counts["filings_failed"]
     # §10 risk mitigation: "990 XML variance ... coverage % logged per run" — surfaces
     # tolerated failures (unsupported zip compression, unresolved archives, malformed
-    # XML) as a rate to watch, not just a raw count.
-    counts["coverage_pct"] = round(counts["filings_parsed"] / total, 4) if total else None
+    # XML) as a rate to watch, not just a raw count. Denominator is Stage 1's survivor
+    # count (`eins`), not filings_parsed + filings_failed (TEST-COVERAGE-GAPS.md G1.3
+    # Gap 11): a survivor with zero filing rows at all never appears in filing_rows,
+    # so a filing-based denominator silently excludes it from both sides of the ratio
+    # and can read as complete coverage even when real survivors were never parsed.
+    # Numerator is signals_computed, the actual survivor-level success signal — an
+    # EIN whose first filing fails but whose second filing parses still gets a
+    # computed signal, so this is stricter and more meaningful than filings_parsed.
+    counts["coverage_pct"] = round(counts["signals_computed"] / len(eins), 4) if eins else None
 
     return counts
