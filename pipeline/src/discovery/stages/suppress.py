@@ -7,6 +7,7 @@ practice, and its result is a flag, never a silent drop.
 from __future__ import annotations
 
 import difflib
+import re
 
 import psycopg
 
@@ -15,9 +16,21 @@ import psycopg
 # happen to share a common word. Tunable — no data yet to calibrate against.
 FUZZY_MATCH_THRESHOLD = 0.85
 
+# Common legal-suffix/descriptor words that differ between how a client refers to
+# themselves (§4 Stage 4's seed names) and their registered 990 name, without being a
+# meaningful distinguishing signal on their own. Found via real near-miss cases
+# ("Butterfly Dreamz, Inc." scored 0.842 against "Butterfly Dreamz" — just under
+# threshold; "SHE DREAMS IN COLOR FOUNDATION" scored 0.776 against "She Dreams in
+# Color") — stripped before scoring rather than just lowering the threshold, since a
+# lower threshold would also make unrelated-org false positives more likely.
+LEGAL_SUFFIX_WORDS = frozenset({"inc", "incorporated", "llc", "corp", "corporation", "foundation"})
+_NON_WORD = re.compile(r"[^\w\s]")
+
 
 def normalize_name(name: str) -> str:
-    return " ".join(name.strip().lower().split())
+    text = _NON_WORD.sub(" ", name.strip().lower())
+    tokens = [t for t in text.split() if t not in LEGAL_SUFFIX_WORDS]
+    return " ".join(tokens)
 
 
 def fuzzy_match_score(name_a: str, name_b: str) -> float:

@@ -34,10 +34,25 @@ def compute_gap_rank(
 ) -> float:
     """0-100, higher = higher priority. Composition over size (§4 Stage 1): revenue
     size isn't a factor here at all — alignment, development-capacity gap, and
-    filing-derived timing urgency are."""
-    weights = {**DEFAULT_GAP_RANK_WEIGHTS, **(weights or {})}
+    filing-derived timing urgency are.
 
-    alignment_score = criteria_met_count / ALIGNMENT_MAX_CRITERIA
+    Two defensive bounds, neither reachable with the defaults but both real risks
+    from an untrusted/mistuned `icp_configs.config.signal_weights`: a
+    `criteria_met_count` above `ALIGNMENT_MAX_CRITERIA` (e.g. a data bug elsewhere)
+    is clamped rather than silently inflating the alignment component past 1.0; a
+    custom `weights` dict summing above 1.0 is scaled back down proportionally
+    (preserving the client's relative priorities, unlike a flat clamp) rather than
+    left free to push the result past 100. The final return is also clamped to
+    [0, 100] as a last-resort backstop regardless of how either input misbehaves —
+    the documented 0-100 contract should hold no matter what a careless config does.
+    """
+    weights = {**DEFAULT_GAP_RANK_WEIGHTS, **(weights or {})}
+    total_weight = sum(weights.values())
+    if total_weight > 1.0:
+        weights = {key: value / total_weight for key, value in weights.items()}
+
+    clamped_criteria = max(0, min(criteria_met_count, ALIGNMENT_MAX_CRITERIA))
+    alignment_score = clamped_criteria / ALIGNMENT_MAX_CRITERIA
     # No development capacity = the biggest gap (most opportunity for a fundraising
     # consultancy); unknown capacity is treated as a moderate gap, not a large one,
     # since "no evidence" isn't the same claim as "confirmed absent".
@@ -49,7 +64,7 @@ def compute_gap_rank(
         + weights["capacity_gap"] * capacity_gap_score
         + weights["trigger"] * trigger_score
     )
-    return round(100 * score, 2)
+    return round(max(0.0, min(100.0, 100 * score)), 2)
 
 
 def load_publishable(conn: psycopg.Connection, client_id: int, icp_version: int) -> list[dict[str, Any]]:
