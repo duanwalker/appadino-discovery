@@ -13,6 +13,16 @@ from discovery.stages.score import (
     enforce_hard_rules,
 )
 
+# org_context is a required argument (not just a fixture nicety — see G1.4 post-close
+# fix #2: it used to default to None and silently skip citation-grounding). Real
+# mission/program text and a real leadership self-description so citations in this
+# file that are genuinely meant to ground (as opposed to the ones deliberately
+# testing an absent/malformed citation) actually verify against it.
+_GROUNDED_CONTEXT = {
+    "mission_text": "We are a Black-led community organization committed to equitable youth development.",
+    "program_text": [{"desc": "Mentorship and after-school tutoring for local families."}],
+}
+
 
 class TestRule1LeadershipComposition:
     """§9 rule 1: never infer race/ethnicity/gender from names or photos — cite
@@ -27,7 +37,7 @@ class TestRule1LeadershipComposition:
                 "needs_human_verification": False,
             }
         }
-        sanitized, _, violations = enforce_hard_rules(values_signals, {})
+        sanitized, _, violations = enforce_hard_rules(values_signals, {}, org_context=_GROUNDED_CONTEXT)
         assert sanitized["leadership_composition"]["score"] is None
         assert sanitized["leadership_composition"]["needs_human_verification"] is True
         assert len(violations) == 1
@@ -37,11 +47,11 @@ class TestRule1LeadershipComposition:
             "leadership_composition": {
                 "score": 70,
                 "rationale": "Org's own materials state it is Black-led.",
-                "citation": "mission_text: 'a Black-led organization committed to...'",
+                "citation": "mission_text: 'a Black-led community organization committed to equitable youth development'",
                 "needs_human_verification": False,
             }
         }
-        sanitized, _, violations = enforce_hard_rules(values_signals, {})
+        sanitized, _, violations = enforce_hard_rules(values_signals, {}, org_context=_GROUNDED_CONTEXT)
         assert sanitized["leadership_composition"]["score"] == 70
         assert violations == []
 
@@ -54,7 +64,7 @@ class TestRule1LeadershipComposition:
                 "needs_human_verification": True,
             }
         }
-        _, _, violations = enforce_hard_rules(values_signals, {})
+        _, _, violations = enforce_hard_rules(values_signals, {}, org_context=_GROUNDED_CONTEXT)
         assert violations == []
 
 
@@ -78,11 +88,11 @@ class TestRule2NeverFullyQualified:
             "programming": {
                 "score": 90,
                 "rationale": "This organization is fully qualified for our services.",
-                "citation": "program_text[0].desc",
+                "citation": "program_text: 'Mentorship and after-school tutoring for local families.'",
                 "needs_human_verification": False,
             }
         }
-        sanitized, _, violations = enforce_hard_rules(values_signals, {})
+        sanitized, _, violations = enforce_hard_rules(values_signals, {}, org_context=_GROUNDED_CONTEXT)
         assert "fully qualified" not in sanitized["programming"]["rationale"].lower()
         assert len(violations) == 1
 
@@ -91,10 +101,10 @@ class TestRule2NeverFullyQualified:
             "mission_alignment": {
                 "met": True,
                 "rationale": "Fully Qualified match on community-centered mission.",
-                "citation": "mission_text",
+                "citation": "mission_text: 'We are a Black-led community organization committed to equitable youth development.'",
             }
         }
-        _, sanitized, violations = enforce_hard_rules({}, alignment_criteria)
+        _, sanitized, violations = enforce_hard_rules({}, alignment_criteria, org_context=_GROUNDED_CONTEXT)
         assert "fully qualified" not in sanitized["mission_alignment"]["rationale"].lower()
         assert len(violations) == 1
 
@@ -103,11 +113,11 @@ class TestRule2NeverFullyQualified:
             "mission_language": {
                 "score": 60,
                 "rationale": "Mission text emphasizes community-centered service.",
-                "citation": "mission_text",
+                "citation": "mission_text: 'We are a Black-led community organization committed to equitable youth development.'",
                 "needs_human_verification": False,
             }
         }
-        sanitized, _, violations = enforce_hard_rules(values_signals, {})
+        sanitized, _, violations = enforce_hard_rules(values_signals, {}, org_context=_GROUNDED_CONTEXT)
         assert sanitized["mission_language"]["rationale"] == values_signals["mission_language"]["rationale"]
         assert violations == []
 
@@ -128,7 +138,9 @@ class TestScoreRangeEnforcement:
                 "needs_human_verification": False,
             }
         }
-        sanitized, _, violations = enforce_hard_rules(values_signals, {})
+        # Out-of-range nulls the score before the citation-grounding check ever
+        # runs (it's gated on score being non-null) — no grounded citation needed.
+        sanitized, _, violations = enforce_hard_rules(values_signals, {}, org_context=_GROUNDED_CONTEXT)
         assert sanitized["programming"]["score"] is None
         assert sanitized["programming"]["needs_human_verification"] is True
         assert len(violations) == 1
@@ -143,17 +155,27 @@ class TestScoreRangeEnforcement:
                 "needs_human_verification": False,
             }
         }
-        sanitized, _, violations = enforce_hard_rules(values_signals, {})
+        sanitized, _, violations = enforce_hard_rules(values_signals, {}, org_context=_GROUNDED_CONTEXT)
         assert sanitized["funder_base"]["score"] is None
         assert sanitized["funder_base"]["needs_human_verification"] is True
         assert len(violations) == 1
 
     def test_boundary_values_are_valid(self) -> None:
         values_signals = {
-            "programming": {"score": 0, "rationale": "x", "citation": "y", "needs_human_verification": False},
-            "funder_base": {"score": 100, "rationale": "x", "citation": "y", "needs_human_verification": False},
+            "programming": {
+                "score": 0,
+                "rationale": "x",
+                "citation": "program_text: 'Mentorship and after-school tutoring for local families.'",
+                "needs_human_verification": False,
+            },
+            "funder_base": {
+                "score": 100,
+                "rationale": "x",
+                "citation": "mission_text: 'We are a Black-led community organization committed to equitable youth development.'",
+                "needs_human_verification": False,
+            },
         }
-        sanitized, _, violations = enforce_hard_rules(values_signals, {})
+        sanitized, _, violations = enforce_hard_rules(values_signals, {}, org_context=_GROUNDED_CONTEXT)
         assert sanitized["programming"]["score"] == 0
         assert sanitized["funder_base"]["score"] == 100
         assert violations == []
@@ -167,7 +189,7 @@ class TestScoreRangeEnforcement:
                 "needs_human_verification": True,
             }
         }
-        _, _, violations = enforce_hard_rules(values_signals, {})
+        _, _, violations = enforce_hard_rules(values_signals, {}, org_context=_GROUNDED_CONTEXT)
         assert violations == []
 
 

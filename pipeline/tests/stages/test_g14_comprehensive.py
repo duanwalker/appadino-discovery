@@ -25,6 +25,15 @@ from discovery.stages.score import (
     enforce_hard_rules,
 )
 
+# org_context is a required argument (see G1.4 post-close fix #2: it used to default
+# to None and silently skip citation-grounding). Real mission/program text and a
+# real leadership self-description so citations in this file that are meant to
+# ground genuinely verify against it.
+_GROUNDED_CONTEXT = {
+    "mission_text": "We are a Black-led community organization committed to equitable youth development.",
+    "program_text": [{"desc": "Mentorship and after-school tutoring for local families."}],
+}
+
 
 class TestEnforceHardRulesDetectsViolations:
     """Gap 1: enforce_hard_rules() must catch violations, not just pass clean data."""
@@ -39,7 +48,7 @@ class TestEnforceHardRulesDetectsViolations:
                 "needs_human_verification": False,  # This is the violation
             }
         }
-        sanitized, _, violations = enforce_hard_rules(values_signals, {})
+        sanitized, _, violations = enforce_hard_rules(values_signals, {}, org_context=_GROUNDED_CONTEXT)
         # Violation must be caught: score forced to None, flag set to True
         assert sanitized["leadership_composition"]["score"] is None
         assert sanitized["leadership_composition"]["needs_human_verification"] is True
@@ -56,19 +65,20 @@ class TestEnforceHardRulesDetectsViolations:
                 "needs_human_verification": False,
             }
         }
-        _, _, violations = enforce_hard_rules(values_signals1, {})
+        _, _, violations = enforce_hard_rules(values_signals1, {}, org_context=_GROUNDED_CONTEXT)
         assert len(violations) == 0
 
-        # Case 2: has citation → not a violation even without needs_human_verification
+        # Case 2: has a citation genuinely grounded in the org's own published text
+        # → not a violation even without needs_human_verification
         values_signals2: dict[str, dict[str, bool | int | None | str]] = {
             "leadership_composition": {
                 "score": 75,
                 "rationale": "No published self-description.",
-                "citation": "mission_text",
+                "citation": "mission_text: 'a Black-led community organization committed to equitable youth development'",
                 "needs_human_verification": False,
             }
         }
-        _, _, violations = enforce_hard_rules(values_signals2, {})
+        _, _, violations = enforce_hard_rules(values_signals2, {}, org_context=_GROUNDED_CONTEXT)
         assert len(violations) == 0
 
         # Case 3: has needs_human_verification=True → not a violation
@@ -80,7 +90,7 @@ class TestEnforceHardRulesDetectsViolations:
                 "needs_human_verification": True,
             }
         }
-        _, _, violations = enforce_hard_rules(values_signals3, {})
+        _, _, violations = enforce_hard_rules(values_signals3, {}, org_context=_GROUNDED_CONTEXT)
         assert len(violations) == 0
 
     def test_rule2_fully_qualified_phrase_in_values_signals_caught(self) -> None:
@@ -93,7 +103,7 @@ class TestEnforceHardRulesDetectsViolations:
                 "needs_human_verification": False,
             }
         }
-        sanitized, _, violations = enforce_hard_rules(values_signals, {})
+        sanitized, _, violations = enforce_hard_rules(values_signals, {}, org_context=_GROUNDED_CONTEXT)
         # Phrase must be redacted
         assert "fully qualified" not in sanitized["population_served"]["rationale"].lower()
         assert "[redacted" in sanitized["population_served"]["rationale"].lower()
@@ -109,7 +119,7 @@ class TestEnforceHardRulesDetectsViolations:
                 "needs_human_verification": False,
             }
         }
-        sanitized, _, violations = enforce_hard_rules(values_signals, {})
+        sanitized, _, violations = enforce_hard_rules(values_signals, {}, org_context=_GROUNDED_CONTEXT)
         assert "fully qualified" not in sanitized["programming"]["rationale"].lower()
         assert "[redacted" in sanitized["programming"]["rationale"].lower()
         assert len(violations) >= 1
@@ -123,7 +133,7 @@ class TestEnforceHardRulesDetectsViolations:
                 "citation": "mission_text",
             }
         }
-        _, sanitized, violations = enforce_hard_rules({}, alignment_criteria)
+        _, sanitized, violations = enforce_hard_rules({}, alignment_criteria, org_context=_GROUNDED_CONTEXT)
         assert "fully qualified" not in sanitized["mission_alignment"]["rationale"].lower()
         assert "[redacted" in sanitized["mission_alignment"]["rationale"].lower()
         assert len(violations) > 0
@@ -144,7 +154,7 @@ class TestEnforceHardRulesDetectsViolations:
                 "needs_human_verification": False,
             },
         }
-        sanitized, _, violations = enforce_hard_rules(values_signals, {})
+        sanitized, _, violations = enforce_hard_rules(values_signals, {}, org_context=_GROUNDED_CONTEXT)
         # Both violations caught
         assert sanitized["leadership_composition"]["score"] is None
         assert "fully qualified" not in sanitized["programming"]["rationale"].lower()
@@ -162,7 +172,7 @@ class TestEnforceHardRulesDetectsViolations:
             "mission_language": {
                 "score": 65,
                 "rationale": "Mission emphasizes community engagement.",
-                "citation": "mission_text",
+                "citation": "mission_text: 'We are a Black-led community organization committed to equitable youth development.'",
                 "needs_human_verification": False,
             },
         }
@@ -170,10 +180,10 @@ class TestEnforceHardRulesDetectsViolations:
             "mission_alignment": {
                 "met": True,
                 "rationale": "Direct match to community-centered language.",
-                "citation": "mission_text",
+                "citation": "mission_text: 'We are a Black-led community organization committed to equitable youth development.'",
             }
         }
-        _, _, violations = enforce_hard_rules(values_signals, alignment_criteria)
+        _, _, violations = enforce_hard_rules(values_signals, alignment_criteria, org_context=_GROUNDED_CONTEXT)
         assert violations == []
 
 
@@ -307,31 +317,37 @@ class TestLeadershipCompositionWithRealContent:
 
     def test_leadership_extraction_from_mission_text_ok(self) -> None:
         """If mission_text contains explicit self-description (e.g., 'Black-led'),
-        enforce_hard_rules should allow a score if citation is present."""
+        enforce_hard_rules should allow a score if the citation is genuinely
+        grounded in that text (not merely present — see G1.4 post-close fix #1)."""
         values_signals = {
             "leadership_composition": {
                 "score": 90,
                 "rationale": "Org explicitly describes itself as Black-led in mission.",
-                "citation": "mission_text: 'A Black-led nonprofit...'",
+                "citation": "mission_text: 'a Black-led community organization committed to equitable youth development'",
                 "needs_human_verification": False,
             }
         }
-        sanitized, _, violations = enforce_hard_rules(values_signals, {})
-        # Has citation → score is preserved, not forced to None
+        sanitized, _, violations = enforce_hard_rules(values_signals, {}, org_context=_GROUNDED_CONTEXT)
+        # Grounded citation → score is preserved, not forced to None
         assert sanitized["leadership_composition"]["score"] == 90
         assert violations == []
 
     def test_leadership_with_explicit_gender_self_description(self) -> None:
-        """If org says 'women-led', that's allowed with citation."""
+        """If org says 'women-led', that's allowed with a citation genuinely
+        grounded in the org's own program text."""
+        women_led_context = {
+            "mission_text": "We serve the community.",
+            "program_text": [{"desc": "Founded by and led by women, our cohort program supports local families."}],
+        }
         values_signals = {
             "leadership_composition": {
                 "score": 85,
                 "rationale": "Organization's materials state it is women-led.",
-                "citation": "program_text[0]: 'Founded by and led by women'",
+                "citation": "program_text: 'Founded by and led by women, our cohort program supports local families.'",
                 "needs_human_verification": False,
             }
         }
-        sanitized, _, violations = enforce_hard_rules(values_signals, {})
+        sanitized, _, violations = enforce_hard_rules(values_signals, {}, org_context=women_led_context)
         assert sanitized["leadership_composition"]["score"] == 85
         assert len(violations) == 0
 
@@ -345,7 +361,7 @@ class TestLeadershipCompositionWithRealContent:
                 "needs_human_verification": False,
             }
         }
-        sanitized, _, _ = enforce_hard_rules(values_signals, {})
+        sanitized, _, _ = enforce_hard_rules(values_signals, {}, org_context=_GROUNDED_CONTEXT)
         # Violation: score + no citation + not marked for verification
         assert sanitized["leadership_composition"]["score"] is None
         assert sanitized["leadership_composition"]["needs_human_verification"] is True
@@ -360,7 +376,7 @@ class TestLeadershipCompositionWithRealContent:
                 "needs_human_verification": True,
             }
         }
-        _, _, violations = enforce_hard_rules(values_signals, {})
+        _, _, violations = enforce_hard_rules(values_signals, {}, org_context=_GROUNDED_CONTEXT)
         assert violations == []  # This is the designed, expected case
 
 
@@ -477,6 +493,7 @@ class TestDisqualifierCorrectness:
         _, _, _ = enforce_hard_rules(
             sonnet_response["values_signals"],
             sonnet_response["alignment_criteria"],
+            org_context=_GROUNDED_CONTEXT,
         )
         # enforce_hard_rules doesn't touch disqualified/dq_reason, but verify structure
         assert isinstance(sonnet_response["disqualified"], bool)

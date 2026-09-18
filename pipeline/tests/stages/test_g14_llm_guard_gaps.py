@@ -12,6 +12,8 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from discovery.stages import run_scoring
 from discovery.stages.publish import load_publishable
 from discovery.stages.score import (
@@ -147,11 +149,12 @@ def test_leadership_citation_with_fabricated_quote_wrapped_as_mission_text_point
     assert len(violations) == 1
 
 
-def test_leadership_grounding_check_is_skipped_when_org_context_omitted() -> None:
-    """Backward-compatible default: omitting org_context (as every pre-fix caller
-    does) falls back to the old structural-only check so tests of the other hard
-    rules don't need a fabricated corpus fixture — not a production code path,
-    since run_scoring always supplies org_context."""
+def test_org_context_is_a_required_argument_not_a_silent_bypass() -> None:
+    """RESOLVED: org_context previously defaulted to None, which silently skipped
+    every grounding check and quietly re-opened the demographic-inference and
+    citation-fabrication loopholes for any future caller that forgot to pass it.
+    It is now a required positional argument — omitting it is a TypeError at call
+    time, not a silent behavior downgrade."""
     values = {
         "leadership_composition": _signal(
             rationale="The executive director appears to be Latina based on her name.",
@@ -160,10 +163,8 @@ def test_leadership_grounding_check_is_skipped_when_org_context_omitted() -> Non
         )
     }
 
-    sanitized, _, violations = enforce_hard_rules(values, {})
-
-    assert sanitized["leadership_composition"]["score"] == 80
-    assert violations == []
+    with pytest.raises(TypeError):
+        enforce_hard_rules(values, {})  # type: ignore[call-arg]
 
 
 def test_capacity_output_is_fixed_pending_discovery_text_for_all_input_shapes() -> None:
@@ -179,14 +180,23 @@ def test_capacity_output_is_fixed_pending_discovery_text_for_all_input_shapes() 
 
 
 def test_forbidden_phrase_is_redacted_from_model_authored_rationales() -> None:
+    """Uses citations that are genuinely grounded in _org_context() so the only
+    violations this test exercises are the forbidden-phrase redactions it's
+    actually about — kept isolated from the separate citation-grounding checks."""
     values = {
-        "programming": _signal(rationale="This prospect is fully qualified for services."),
+        "programming": _signal(
+            rationale="This prospect is fully qualified for services.",
+            citation="program_text: 'Community leadership cohort and after-school tutoring services.'",
+        ),
     }
     criteria = {
-        "mission_alignment": _criterion(rationale="Fully qualified based on mission fit."),
+        "mission_alignment": _criterion(
+            rationale="Fully qualified based on mission fit.",
+            citation="mission_text: 'We are a Black-led community organization providing youth mentorship and family support.'",
+        ),
     }
 
-    sanitized_values, sanitized_criteria, violations = enforce_hard_rules(values, criteria)
+    sanitized_values, sanitized_criteria, violations = enforce_hard_rules(values, criteria, org_context=_org_context())
 
     assert sanitized_values["programming"]["rationale"] == "[redacted: contained a disallowed phrase]"
     assert sanitized_criteria["mission_alignment"]["rationale"] == "[redacted: contained a disallowed phrase]"
@@ -299,14 +309,11 @@ def test_citation_grounded_in_real_program_text_is_left_intact() -> None:
     assert violations == []
 
 
-def test_citation_enforcement_is_skipped_when_org_context_omitted() -> None:
+def test_citation_enforcement_also_requires_org_context() -> None:
     values = {"funder_base": _signal(citation={"source": "mission_text"})}
 
-    sanitized, _, violations = enforce_hard_rules(values, {})
-
-    assert sanitized["funder_base"]["score"] == 80
-    assert sanitized["funder_base"]["citation"] == {"source": "mission_text"}
-    assert violations == []
+    with pytest.raises(TypeError):
+        enforce_hard_rules(values, {})  # type: ignore[call-arg]
 
 
 def test_alignment_met_true_without_citation_is_now_rejected() -> None:
@@ -361,13 +368,11 @@ def test_alignment_met_false_is_never_checked_for_citation() -> None:
     assert violations == []
 
 
-def test_alignment_enforcement_is_skipped_when_org_context_omitted() -> None:
+def test_alignment_enforcement_also_requires_org_context() -> None:
     criteria = {"mission_alignment": _criterion(met=True, citation=None)}
 
-    _, sanitized, violations = enforce_hard_rules({}, criteria)
-
-    assert sanitized["mission_alignment"]["met"] is True
-    assert violations == []
+    with pytest.raises(TypeError):
+        enforce_hard_rules({}, criteria)  # type: ignore[call-arg]
 
 
 def test_grant_writing_disqualified_result_is_persisted_with_redacted_reason_by_orchestrator() -> None:
