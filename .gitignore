@@ -17,6 +17,18 @@ build/
 # Pipeline generated output (CSV exports, §4 Stage 6)
 pipeline/output/
 
+# Dashboard — Functions API (local secrets, build artifacts)
+dashboard/functions_api/local.settings.json
+dashboard/functions_api/.python_packages/
+dashboard/functions_api/__azurite_db*__.json
+dashboard/functions_api/__blobstorage__/
+dashboard/functions_api/__queuestorage__/
+
+# Dashboard — React app
+dashboard/web/node_modules/
+dashboard/web/dist/
+dashboard/web/*.tsbuildinfo
+
 # Bicep
 infra/*.bicepparam.local
 main.json

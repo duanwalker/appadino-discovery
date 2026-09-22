@@ -1,0 +1,8 @@
+azure-functions>=1.21
+
+# Import-strategy decision (see README.md): local/dev installs the pipeline's
+# `discovery` package as an editable path dependency straight from the monorepo,
+# so the Functions API and the pipeline always run against the exact same
+# SQLAlchemy models and DB helpers — no drift, no duplicated schema knowledge.
+# sqlalchemy/psycopg/etc. come in transitively via pipeline/pyproject.toml.
+-e ../../pipeline

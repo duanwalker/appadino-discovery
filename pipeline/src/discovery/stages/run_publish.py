@@ -122,7 +122,11 @@ def run_publish(
                     weights=gap_rank_weights,
                 )
 
-                notes = f"Possible suppression match: '{fuzzy_flags[ein]}' (fuzzy, not auto-excluded)" if ein in fuzzy_flags else None
+                suppression_flag = (
+                    f"Possible suppression match: '{fuzzy_flags[ein]}' (fuzzy, not auto-excluded)"
+                    if ein in fuzzy_flags
+                    else None
+                )
 
                 upsert_prospect(
                     conn,
@@ -133,7 +137,7 @@ def run_publish(
                         "trigger_angle": trigger_angle,
                         "trigger_evidence": Json(detected) if detected else None,
                         "gap_rank": gap_rank,
-                        "notes": notes,
+                        "suppression_flag": suppression_flag,
                         "updated_at": datetime.now(UTC),
                     },
                 )

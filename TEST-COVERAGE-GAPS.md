@@ -1,5 +1,90 @@
 # G1.2 Ingest Pipeline — Test Coverage Gaps & New Test Suite
 
+## E2 Independent Test Pass (2026-09-21)
+
+New independent tests exercise the E2 officer selector, provider-domain classification,
+bounded polling, enrich HTTP routes, contact mismatch payload, and CSV/table contact states.
+
+### Confirmed-safe
+
+- Adversarial officer lists select a current CEO even when it is not first, retain a
+   board president as the best available choice when there is no staff officer, and
+   demote a departed CFO below a current title-tied CFO.
+- `gmail.com`, `yahoo.com`, `hotmail.com`, and `outlook.com` preserve FullEnrich's
+   reported status; non-personal organizational mismatches become `stale_likely_moved`;
+   a null organization website/domain preserves the provider status.
+- The actual `enrich-status` HTTP route re-enforces all three hard-rule-8 conditions
+   independently after an in-flight job, returning their documented 403 bodies.
+- A fresh filing's new CEO versus an old enrichment produces `contact_mismatch`; a
+   re-enrichment for the current CEO clears it. A never-resolving provider is polled
+   exactly to the configured bounded limit.
+- The React hook does automatically poll after a `202` response (up to 40 polls at
+   three-second intervals); this was established by code-path inspection because the
+   web package has no browser-test runner yet.
+
+### Real bugs (executable `xfail` regressions) — two of three fixed, see Resolution below
+
+| Severity | Finding | Location | Status |
+|---|---|---|---|
+| High | A second Enrich POST while the first job is pending submits a second provider job. Result persistence is idempotent only after completion, so duplicate clicks can spend credits twice. | `function_app.py` `enrich_prospect()` | ✅ Fixed |
+| Medium | `contact_mismatch` compares only names. Same-name role changes (for example, current CEO versus stored former CEO title) are presented as the same contact. | `function_app.py` `_build_contact()` | ⚠️ Flagged, not fixed — held for a separate product decision, explicitly out of scope for this pass |
+| Medium | CSV omits retention-expired and `contact_mismatch` signals that the dashboard visibly renders, so E2's CSV/table parity is incomplete for those states. | `function_app.py` `_prospect_row_to_csv_dict()` | ✅ Fixed |
+
+The three `xfail(strict=True)` tests intentionally preserved these findings without
+modifying implementation code during the original test-only review.
+
+## Resolution (2026-09-22)
+
+Two of the three flagged gaps were fixed; the third (`contact_mismatch`'s name-only
+comparison) is deliberately untouched — Duan scoped it to a separate product decision
+about whether a title change alone should also count as a mismatch, not a bug fix.
+
+- **Duplicate submission on double-click (High)** — an in-process guard alone can't
+  prevent this in production, since Azure Functions can run multiple instances, each
+  starting with empty process memory. Fixed with a real atomic claim at the database
+  layer: a new `enrichment_jobs` table (migration `d3f9a1c6e8b2`) with
+  `UNIQUE(client_id, ein)` — a concurrent `INSERT ... ON CONFLICT (client_id, ein) DO
+  NOTHING RETURNING id` can never let two requests both "win" the claim, regardless of
+  which instance handles them (`function_app._claim_pending_slot`). The claim is taken
+  only after a candidate is confirmed buildable (so a request that would 422 anyway
+  never blocks a real future attempt), and released the moment a job resolves
+  (`_clear_pending_slot`), including on an unexpected exception mid-flight, so a
+  completed or errored job never permanently locks out re-enrichment for that org. A
+  same-process in-memory cache (`_PENDING_JOBS`) sits in front of the DB claim purely
+  as a fast path for the common same-instance double-click — explicitly documented as
+  *not* the correctness mechanism, since the DB constraint is what actually prevents
+  the duplicate. **Verified against the real dev Postgres, not just mocks**: the
+  `UNIQUE` constraint was confirmed live — a duplicate insert for the same
+  `(client_id, ein)` raises a genuine `UniqueViolation` (test row inserted and cleaned
+  up, no residue left in the dev DB). Known, explicitly out-of-scope follow-up: a job
+  that's claimed but never resolves at all (a crash mid-flight, not a double-click) has
+  no TTL/cleanup yet and would permanently block re-enrichment for that org until
+  someone deletes the stale row by hand — Copilot's test only covers the double-submit
+  case, not job abandonment.
+- **CSV missing retention-expired and contact_mismatch signals (Medium)** —
+  `_prospect_row_to_csv_dict()` now calls the same `_build_contact()` the dashboard
+  table already uses (rather than re-deriving locked/expired/mismatch from raw row
+  fields a second time, which would risk the two silently disagreeing), and surfaces
+  both signals as inline notes: `" (expired)"` appended to `contact_status` when
+  `retention_expired`, and `" (enriched for {name})"` appended to `contact_email` when
+  `contact_mismatch` — chosen so neither note collides with the existing exact-string
+  assertions on `contact_status` in the already-passing
+  `test_csv_and_table_payload_agree_for_locked_and_stale_contact_states` test. Does
+  **not** touch how `contact_mismatch` itself is computed (that comparison logic is
+  explicitly out of scope this pass) — only how the existing signal is represented in
+  the CSV.
+
+Both `xfail(strict=True)` markers were removed from `test_e2_independent.py` (not just
+made to pass with the marker left in place); the third, out-of-scope test
+(`test_same_name_but_changed_ceo_title_is_a_contact_mismatch`) remains `xfail` untouched.
+A fourth test was added directly to `test_e2_enrich_routes.py`
+(`test_double_submit_blocked_by_db_claim_when_in_process_cache_is_cold`) proving the DB
+claim itself — not just the in-process cache — blocks a second submission, simulating a
+cold second Functions instance with no shared cache.
+
+**Full suite after fix: pipeline 381/381, Functions API 63 passed + 1 xfail (the
+explicitly out-of-scope test)**, both ruff/mypy clean; React app builds clean.
+
 ## Resolution (2026-09-16)
 
 All three flagged gaps were fixed in `discovery.stages.ingest`:
@@ -576,4 +661,108 @@ python -m pytest -q
 ```
 
 Output (post-fix, 2026-09-18): **30 passed** (`test_g13_filter_signal_gaps.py`, up from 29) / **325 passed** (full suite, up from the 324-test baseline). Ruff-clean, `mypy src` clean.
+
+---
+
+## G2.x Dashboard + Functions API — Independent Test Coverage Review
+
+## Summary
+
+Added **16 pytest cases** in [dashboard/functions_api/tests/test_g2_dashboard_gaps.py](dashboard/functions_api/tests/test_g2_dashboard_gaps.py) covering the new Python Azure Functions API routes, the migration `4a2e9c1f7b3d` status constraint, and the publish upsert behavior that protects human-owned review fields.
+
+This review intentionally avoids a live DB/browser and uses synthetic rows plus fake connection/cursor objects, matching the repo's established fake-connection pattern. The tests characterize current behavior rather than assuming the desired behavior: clean 4xx paths are asserted as such, while validation gaps are pinned as current pass-through behavior and flagged below.
+
+**Full Python suite: 349/349 passing** (`pipeline/tests` + `dashboard/functions_api/tests`). Focused validation: `test_g2_dashboard_gaps.py` is **16/16 passing**. No implementation code was modified in this review.
+
+---
+
+## Coverage by Gap
+
+### Gap 1: Human Notes / `updated_by` Preservation on Republish (2 tests)
+
+**What was untested:** the exact data-loss scenario behind the G2.x groundwork fix: a prospect already reviewed by Lauren (`status='approved'`, real note, real `updated_by`) being republished by the pipeline and silently losing the human review state.
+
+**Tests added:** a synthetic `upsert_prospect()` replay with an existing approved prospect and human-authored note. The fake conflict-update path inspects the SQL update clause and mutates any field the SQL would update on conflict, then asserts `status`, `notes`, and `updated_by` remain untouched while pipeline-owned fields (`assigned_trigger`, `trigger_evidence`, `gap_rank`, `suppression_flag`, `updated_at`) refresh. A separate SQLite DB-layer test recreates the migration's `status IN ('new','reviewed','approved','rejected')` check and confirms an arbitrary Phase 2 state (`contacted`) is rejected by the database constraint, not merely UI code.
+
+**Result:** ✅ The republish path preserves human-owned fields in the synthetic conflict scenario. ✅ The status check constraint semantics reject out-of-enum values at the DB layer.
+
+---
+
+### Gap 2: Functions API Input Validation, Per Route (8 tests)
+
+**What was untested:** whether malformed input is rejected by each route before SQL, or whether bad values fall through to a DB operation that could surface as a raw constraint error or clean-but-misleading success.
+
+**Tests added:** one malformed-input case per route:
+
+- `GET /api/prospects` missing `client_id` returns 400 before opening a DB connection.
+- `PATCH /api/prospects/{id}` with `status='contacted'` returns 400 before opening a DB connection.
+- `POST /api/prospects/{id}/suppression-review` with invalid action returns 400 before opening a DB connection.
+- `GET /api/suppression` with `client_id='not-an-int'` currently reaches SQL and returns 200 with an empty fake result.
+- `POST /api/suppression` with `ein='not-an-ein'` currently reaches the insert path and returns 201.
+- `DELETE /api/suppression/{id}` with a nonexistent/malformed id returns a clean 404 from the fake DB path.
+- `GET /api/export.csv` missing `client_id` returns 400 before opening a DB connection.
+- `GET /api/runs` with `limit='many'` returns 400 before opening a DB connection.
+
+**🟡 Gaps discovered:** `client_id` is presence-checked but not type/shape-checked on read routes, and manual suppression `ein` is not validated before insert. Those are not crashes in the synthetic tests, but they mean malformed values can reach SQL and depend on DB behavior instead of the API returning a deterministic validation error.
+
+---
+
+### Gap 3: Suppression-Flag Confirm/Dismiss Boundary (2 tests)
+
+**What was untested:** whether dismissing a fuzzy suppression flag is structurally limited to clearing `prospects.suppression_flag`, rather than touching hard EIN suppression state or shared suppression code.
+
+**Tests added:** `suppression_review(action='dismiss')` with a fake prospect asserts the executed SQL contains no `INSERT INTO suppression` and no `DELETE FROM suppression`; it only runs the prospect update that clears `suppression_flag` by prospect id. A companion `confirm` test asserts the confirm path intentionally inserts a `kind='client'` suppression row for that EIN and then clears the flag.
+
+**Result:** ✅ Dismiss is structurally isolated from hard EIN suppression and does not un-suppress anything. Confirm and dismiss do not call the Stage 4 suppression matcher; the dashboard route uses direct SQL. Confirm does add a real suppression row by EIN, which is the intended "turn fuzzy match into confirmed suppression" action.
+
+---
+
+### Gap 4: Functions API Route Protection (1 test)
+
+**What was untested:** whether the new API has at least function-key-level protection, even though broader auth is explicitly out of scope for this local-only dashboard pass.
+
+**Tests added:** direct inspection of the Azure Functions app registration confirms `AuthLevel.ANONYMOUS`.
+
+**🔴 Gap discovered:** the Functions API is currently open to anyone who can reach the URL. This matches the README/STATUS local-review caveat, but it is now pinned by an executable test rather than assumed. Before any public Lauren-facing deployment, the app needs at least function-key-level protection or a real auth layer.
+
+---
+
+### Gap 5: JSONB→JSON Transformation Robustness (3 tests)
+
+**What was untested:** partially-null or malformed JSONB shapes from older/edge-case rows, especially `values_signals`, `alignment`, `capacity`, and `trigger_evidence` from the `scores`/`prospects` join.
+
+**Tests added:** `_row_to_prospect()` with partial null JSONB confirms the API can return nullable score payloads without throwing. `_prospect_row_to_csv_dict()` is exercised with malformed `alignment` (`list`) and malformed `capacity` (`str`) shapes.
+
+**🟡 Gap discovered:** the main JSON response transform degrades gracefully for partial nulls, but the CSV transform assumes `alignment` and `capacity` are dict-like. Older or corrupted rows with non-object JSONB in either field raise `AttributeError` instead of degrading to blank CSV cells or returning a clean 4xx/5xx with a controlled error body.
+
+---
+
+## Uncovered Issues Flagged for Review
+
+| Issue | Severity | Location | Status |
+|-------|----------|----------|--------|
+| `GET /api/suppression` accepts non-numeric `client_id` and reaches SQL | Low | `dashboard/functions_api/function_app.py` `list_suppression()` | ⚠️ Flagged, not fixed |
+| `POST /api/suppression` accepts malformed EIN values and reaches insert path | Medium | `dashboard/functions_api/function_app.py` `create_suppression()` | ⚠️ Flagged, not fixed |
+| Functions API is registered with `AuthLevel.ANONYMOUS`; no function-key-level protection | High before public deploy | `dashboard/functions_api/function_app.py` app registration | ⚠️ Flagged, not fixed |
+| CSV transform throws on non-object `alignment` / `capacity` JSONB instead of degrading gracefully | Low | `dashboard/functions_api/function_app.py` `_prospect_row_to_csv_dict()` | ⚠️ Flagged, not fixed |
+| Republish overwrites human `notes` / `updated_by` | High if present | `pipeline/src/discovery/stages/publish.py` `upsert_prospect()` | ✅ No gap found |
+| Dashboard dismiss action can affect hard EIN suppression or un-suppress orgs | High if present | `dashboard/functions_api/function_app.py` `suppression_review()` | ✅ No gap found |
+| Status values outside `new|reviewed|approved|rejected` bypass DB constraint | Medium if present | `pipeline/alembic/versions/4a2e9c1f7b3d_g2_prospects_suppression_flag_status_.py` | ✅ No gap found |
+
+---
+
+## Test Execution
+
+```powershell
+cd dashboard/functions_api
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt pytest
+.\.venv\Scripts\python.exe -m pytest tests/test_g2_dashboard_gaps.py -q
+
+cd ..\..
+$env:PYTHONPATH = "$PWD\dashboard\functions_api;$PWD\pipeline\src"
+.\dashboard\functions_api\.venv\Scripts\python.exe -m pytest pipeline/tests dashboard/functions_api/tests -q
+```
+
+Output: **16 passed** (`test_g2_dashboard_gaps.py`) / **349 passed** (full Python suite).
 

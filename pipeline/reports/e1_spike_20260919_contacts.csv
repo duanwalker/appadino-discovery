@@ -1,0 +1,18 @@
+ein,org_name,contact_name,contact_title,email,email_status,phone,org_website,domain_check
+010332769,FREEPORT COMMUNITY SERVICES INC,Sarah Lundin,EXECUTIVE DIRECTOR,slundin@fcsmaine.org,catch_all,+1 207-671-2868,WWW.FCSMAINE.ORG,MATCH
+010322532,DAY ONE,Gregory Bowers,CEO (THRU MAR 2024),gbowers@sheppardpratt.org,catch_all,+1 207-756-0558,WWW.DAY-ONE.ORG,MISMATCH (sheppardpratt.org != day-one.org)
+010360259,SOUTHERN MAINE AGENCY ON AGING,Megan Walton,CEO,mwalton@smaaa.org,catch_all,+1 208-610-3941,www.smaaa.org,MATCH
+010275447,CHILDRENS CENTER EARLY INTERVENTION AND FAMILY SUPPORT,Jeffrey Johnson,Executive Director,jjohnson@childrensctr.org,verified,,http://www.childrensctr.org,MATCH
+010275156,WESTERN MAINE COMMUNITY ACTION INC,William Crandall,INTERIM EXECUTIVE DIRECTOR,,,+1 207-778-9023,WWW.WMCA.ORG,n/a (no email)
+010324705,SUSAN L CURTIS CHARITABLE FOUNDATION,Scott Merrow,Executive Director,smerrow@susancurtis.org,verified,+1 603-986-6260,www.susancurtis.org,MATCH
+010275159,JUNIOR ACHIEVEMENT OF MAINE INC,Michelle Anderson,PRESIDENT,manderson@jamaine.org,verified,+1 207-939-9520,WWW.JAMAINE.ORG,MATCH
+010353682,LEARNING WORKS,Tom Mclaughlin,Executive Director,tmclaughlin@learningworks.me,verified,,WWW.LEARNINGWORKS.ME,MATCH
+010211567,YOUNG MENS CHRISTIAN ASSOCIATION AUBURN-LEWISTON MAINE,Steven Wallace,CHIEF EXECUTIVE OFFICER,stevenwallace@sjcme.edu,verified,+1 207-577-8108,WWW.ALYMCA.ORG,MISMATCH (sjcme.edu != alymca.org)
+010343943,SEXUAL ASSAULT RESPONSE SERVICES OF SOUTHERN MAINE,Erin K Flood,Executive Director,eflood@sarssm.org,verified,+1 401-309-1953,www.sarssm.org,MATCH
+010355822,MAINE SPECIAL OLYMPICS,Philip Geelhoed,CEO,philg@somaine.org,verified,,WWW.SOMAINE.ORG,MATCH
+010211812,BATH AREA FAMILY YMCA,Rob Gray,CEO,rob.gray@ymcahuntsville.org,verified,+1 615-598-4145,WWW.BATHYMCA.ORG,MISMATCH (ymcahuntsville.org != bathymca.org)
+010354589,EASTPORT HEALTH CARE INC,Ellen Krajewski,CEO,ekrajewski@eastporthealth.org,verified,,www.eastporthealth.org,MATCH
+010349310,IAM-3RIVERS INC,Brandie Dewitt,President-BOD,,,+1 207-478-8990,www.iamsupports.org,n/a (no email)
+010211512,HOME FOR THE AGED,Lorri Sommer,CEO,sommerl@parkdanforth.com,verified,+1 207-450-8934,www.parkdanforth.com,MATCH
+010315732,MIDCOAST MAINE COMMUNITY ACTION,Claire Berkowitz,EXECUTIVE DI,claire.berkowitz@mmcacorp.org,verified,+1 207-730-3159,WWW.MIDCOASTMAINECOMMUNITYACTION.ORG,MISMATCH (mmcacorp.org != midcoastmainecommunityaction.org)
+010180531,WEST OXFORD AGRICULTURAL SOCIETY,David R Hastings Iii,President,dhastings@fryeburgfair.org,verified,,WWW.FRYEBURGFAIR.ORG,MATCH

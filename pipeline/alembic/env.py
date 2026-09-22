@@ -9,6 +9,7 @@ from alembic import context
 from discovery.db import Base
 from discovery.models import (  # noqa: F401 — registers metadata
     Client,
+    Enrichment,
     Filing,
     IcpConfig,
     Organization,

@@ -1,4 +1,6 @@
 from discovery.models.clients import Client
+from discovery.models.enrichment_jobs import EnrichmentJob
+from discovery.models.enrichments import Enrichment
 from discovery.models.filings import Filing
 from discovery.models.icp_configs import IcpConfig
 from discovery.models.organizations import Organization
@@ -11,6 +13,8 @@ from discovery.models.suppression import Suppression
 
 __all__ = [
     "Client",
+    "Enrichment",
+    "EnrichmentJob",
     "Filing",
     "IcpConfig",
     "Organization",

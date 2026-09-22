@@ -20,6 +20,14 @@ class Prospect(Base):
     mapping exists, e.g. first_filing_above_floor, rather than inventing one) and
     trigger_evidence (the citable facts behind the trigger — every claim needs a
     citation, triggers are no exception).
+
+    G2.x addition: `suppression_flag` (pipeline-written fuzzy-suppression message,
+    split out of `notes` — see migration 4a2e9c1f7b3d) keeps `notes` purely
+    human-owned for the dashboard's review comments; the publish upsert never
+    touches `notes` or `updated_by` once a row exists (stages/publish.py). `status`
+    is CHECK-constrained to the four states §5's dashboard workflow uses (new|
+    reviewed|approved|rejected) — the brief's §3 sketch also lists contacted|
+    responded, which belong to the Phase 2 Outreach queue and are out of scope here.
     """
 
     __tablename__ = "prospects"
@@ -33,6 +41,7 @@ class Prospect(Base):
     trigger_angle: Mapped[str | None] = mapped_column(String(255))
     trigger_evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     gap_rank: Mapped[float | None] = mapped_column(Numeric)
+    suppression_flag: Mapped[str | None] = mapped_column(Text)
     notes: Mapped[str | None] = mapped_column(Text)
     updated_by: Mapped[str | None] = mapped_column(String(100))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

@@ -105,22 +105,28 @@ def load_filing_pair(conn: psycopg.Connection, ein: str) -> tuple[dict[str, Any]
 
 
 def upsert_prospect(conn: psycopg.Connection, row: dict[str, Any]) -> None:
+    """`notes` and `updated_by` are deliberately absent from the UPDATE branch (and
+    `notes` from the INSERT columns too — it starts NULL): both are human-owned once
+    the dashboard exists, and a republish (e.g. §7's weekly score refresh) must never
+    clobber a reviewer's comment or misattribute their decision to 'pipeline'. The
+    pipeline's own fuzzy-suppression message goes in `suppression_flag` instead,
+    which IS pipeline-owned and safe to overwrite on every run.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO prospects
                 (client_id, ein, status, assigned_trigger, trigger_angle, trigger_evidence,
-                 gap_rank, notes, updated_by, updated_at)
+                 gap_rank, suppression_flag, updated_by, updated_at)
             VALUES
                 (%(client_id)s, %(ein)s, 'new', %(assigned_trigger)s, %(trigger_angle)s,
-                 %(trigger_evidence)s, %(gap_rank)s, %(notes)s, 'pipeline', %(updated_at)s)
+                 %(trigger_evidence)s, %(gap_rank)s, %(suppression_flag)s, 'pipeline', %(updated_at)s)
             ON CONFLICT (client_id, ein) DO UPDATE SET
                 assigned_trigger = EXCLUDED.assigned_trigger,
                 trigger_angle = EXCLUDED.trigger_angle,
                 trigger_evidence = EXCLUDED.trigger_evidence,
                 gap_rank = EXCLUDED.gap_rank,
-                notes = EXCLUDED.notes,
-                updated_by = 'pipeline',
+                suppression_flag = EXCLUDED.suppression_flag,
                 updated_at = EXCLUDED.updated_at
             """,
             row,

@@ -1,4 +1,4 @@
-# Appadino Discovery — Phase 1 Implementation Brief (v2.2)
+# Appadino Discovery — Phase 1 Implementation Brief (v2.3)
 
 **Project:** Nonprofit prospect discovery pipeline (working name: **Discovery** / DiscoveryAI)
 **Repo:** `appadino-discovery` (private)
@@ -9,6 +9,10 @@
 **Changelog (v2.0 → v2.1):** FullEnrich reseller terms confirmed by Hugo (FullEnrich) — Reseller Agreement is the access path (not self-serve Pro); per-tenant `fullenrich_subaccount_id` added for the `Sub-Account-Id` API header; 90-day retention field added to `enrichments`; nonprofit/advocacy vertical confirmed in scope, consumer political/voter data confirmed out of scope. Scoping call rescheduled from Sept 10 to **Wednesday, Sept 16, 2026**.
 
 **Changelog (v2.1 → v2.2):** Switched the FullEnrich starter tier from the $250/mo annual-commit plan (10,000 credits/month, ~$3,000/year obligation) to the **$500 one-time 12,500-credit pack** (6-month validity, no recurring commitment) — sized to current single-client volume, and avoids locking in a 12-month spend before gate E1 has validated real match rates and cost-per-contact.
+
+**Changelog (v2.2 → v2.3):** Two clarifications from the real E1 spike run (see `pipeline/reports/e1_spike_20260919.md`): (1) disambiguated the "API over file export" client-integration decision from the dashboard's own CSV export button, since the shared "file export" language had caused real confusion between the two (§2); (2) redesigned the dashboard's contact display from a single flag-gated "Enrichment column" into five always-present columns, with Name/Title free and always visible and Email/Phone/Status locked until per-prospect enrichment — supersedes the prior design (§5).
+
+**Changelog (v2.3 → v2.4):** Two decisions from the E2 build session that v2.3's changelog never actually recorded, even though STATUS.md had already flagged both as carried into E2 from E1's close — this entry catches the brief up to what shipped (§5): (1) a fourth `email_status` bucket, `stale_likely_moved`, for a match FullEnrich reports as findable/verified but whose email domain doesn't belong to the org being prospected (E1's Day One finding — an officer resolving to a colleague's employer's domain); (2) the "real-vs-verified confidence signal" STATUS.md flagged as undesigned turned out not to need a separate mechanism — it's the same domain comparison that sets `stale_likely_moved`, with a personal-email-domain carve-out (gmail/yahoo/etc.) so an unpaid board volunteer's real, current personal address isn't misread as "moved." Also: the Name/Title-vs-enrichment-divergence open question v2.3 already posed in §5 is still open, but E2 now surfaces it visibly in the dashboard (a `contact_mismatch` flag) rather than silently picking an answer.
 
 ---
 
@@ -56,6 +60,7 @@ A multi-tenant pipeline that ingests the national IRS nonprofit universe, applie
 - **PostgreSQL Flexible Server (B1ms)**: real SQL for the staged filters, JSONB for ICP configs and extracted signals, ~$15/mo. SQLite would be cheaper but kills the multi-tenant story and concurrent dashboard access.
 - **Static Web Apps**: Duan's proven pattern (portfolio site, AlphaBot). Free tier fine for Phase 1.
 - **Batch API for scoring**: runs are overnight anyway; 50% off makes national-scale scoring a non-event cost-wise.
+- **API over file export** (client-integration handoff, not the dashboard): when a client's own downstream system — e.g. ARCHITECT's Operations app — needs to receive DiscoveryAI data on an ongoing basis, the decision is API delivery, not periodic flat-file drops. This is a **separate decision from the dashboard's own one-click CSV export button** (§5) — that button is a standard feature available to every customer regardless of enrichment tier, and this decision doesn't change it. Both have been called "file export" in conversation, which has caused real confusion between the two; this line exists to keep them distinct.
 
 **Estimated run cost:** Postgres ~$15/mo + Container Apps ~$2–5/mo + Claude API ~$10–40/full national run (see §6 token math) + SWA free + FullEnrich (one-time $500/12,500-credit pack, 6-month validity, chosen reseller starter tier — only if E-gates pass, only on approved prospects; see §5.5). Well under the $399/mo Discovery price point, even fully loaded.
 
@@ -97,7 +102,8 @@ prospects          id, client_id, ein, status
                    assigned_trigger, notes, updated_by, updated_at
 enrichments        id, client_id, ein, prospect_id, provider (fullenrich),
                    contact_name, contact_title, email, email_status
-                   (verified|catch_all|not_found), phone, linkedin_url,
+                   (verified|catch_all|not_found|stale_likely_moved),
+                   stale_detail, phone, linkedin_url,
                    provider_confidence, raw JSONB, credits_spent,
                    requested_at, completed_at, retention_expires_at
                    -- populated ONLY for status=approved prospects,
@@ -201,8 +207,14 @@ React on Static Web Apps, Functions API over Postgres:
 - Status workflow: new → reviewed → approved / rejected (checkbox-fast), notes field
 - Suppression manager (add/remove entries)
 - Outreach queue **stub**: approved prospects listed with assigned trigger/angle — drafting and sending are Phase 2, human-gated by design
-- Enrichment column (renders only when `enrichment_enabled`): contact, email with status badge (including retention-expired state), provider + confidence on hover; "Enrich" action button per approved prospect (manual trigger first; batch auto-enrich only after E2 passes)
-- CSV export button (Lauren's spreadsheet, one click; enrichment columns included when present)
+- **Contact columns** (v2.3, supersedes the earlier flag-gated "Enrichment column" design) — five separate columns, not a combined cell:
+  - **Name** and **Title**: always visible, for every customer, for every prospect — free, sourced from the org's own latest 990 filing officers (`filings.officers`), clearly labeled as unverified (self-reported on a tax filing, not confirmed by any enrichment provider). Not gated by `enrichment_enabled` — this is public data already used elsewhere in the pipeline (Stage 2 development-capacity signals), not third-party contact data, so it doesn't touch hard rules 3/8 (§9).
+  - **Email**, **Phone**, **Status**: empty/locked by default. A human explicitly triggers enrichment via a per-prospect "Enrich" button on an `approved` prospect; only then do these three populate from `enrichments`, with a status badge and provider + confidence on hover. §5.5's guards (`enrichment_enabled`, `fullenrich_subaccount_id`, `approved`-only) and §9 rule 8 still gate whether the Enrich trigger *fires* — they don't affect whether Name/Title render. Batch auto-enrich remains E2-only.
+  - **Status is a four-way bucket, not three (v2.4):** `verified` / `catch_all` / `not_found` / **`stale_likely_moved`**. The fourth bucket covers a match FullEnrich reports as findable/verified whose email domain doesn't belong to the org being prospected — real signal, not a failure state (E1's Day One finding: an officer's email resolved to a different, current employer's domain). Set by comparing the enriched email's domain against the org's own website domain, with the mismatched domain surfaced as `stale_detail` for the dashboard tooltip.
+  - **Real-vs-verified confidence signal (v2.4, resolves the E1-close open item):** the same domain comparison above *is* the confidence signal — it doesn't need a separate mechanism from staleness. The one thing that comparison must not do naively: a domain-only check would misread an unpaid board volunteer's real, current personal email (gmail, yahoo, etc.) as "moved," since volunteers routinely list a personal address on the 990 even when their role is completely current. Personal-domain matches are excluded from the mismatch inference entirely and keep FullEnrich's own reported status untouched.
+  - **Open question for Duan, still open in v2.4:** the E1 spike found FullEnrich sometimes resolves a more accurate identity than the raw 990 text (e.g. 990 listed "Lundin Sarah"; FullEnrich matched a LinkedIn profile and returned "Sarah Lundin"). Undecided: does a confirmed enrichment ever update Name/Title, or do they always stay as the original unverified 990 entry regardless of what Email/Phone/Status resolve to? E2 doesn't resolve this — Name/Title always track the *current* latest-filing officer, independent of enrichment history — but does now surface a `contact_mismatch` flag when the two diverge (e.g. an org's leadership changed since its last enrichment), so a reviewer sees the divergence instead of the dashboard silently implying the enriched contact info belongs to whoever Name/Title currently shows.
+  - Applies identically to the dashboard table and the CSV export (below).
+- CSV export button (Lauren's spreadsheet, one click; same five contact columns as the table — Name/Title always populated, Email/Phone/Status empty/locked unless individually enriched)
 - Run history + last-run health banner
 - Multi-tenant from day one: client switcher hidden behind a config flag; single-tenant deployment
 
@@ -271,7 +283,7 @@ Gates advance strictly in order within a track; Duan reviews and approves each b
 
 ## 11. Claude Code kickoff prompt
 
-> You are the implementer for `appadino-discovery`, working from `discovery-phase1-implementation-brief-v2.2.md` at repo root. Work gate by gate (§8), strictly in sequence, one scoped commit per gate item, conventional commit messages. Never start the next gate before I approve the current one. My sessions are irregular and may be days apart: end every gate with passing tests, a clean `main`, and an updated `STATUS.md` (done / next / open questions / decisions awaiting me) — assume the next session starts cold from that file. Python 3.12, type-hinted, pytest per module; infra as Bicep in `/infra`; config never hardcoded — everything tenant-variable lives in `icp_configs.config`. The hard rules in §9 are test cases first. The enrichment stage (§5.5, gates E1/E2) is candidate scope: write zero enrichment code unless I explicitly open gate E1. Start with G1.1: propose the repo layout and the Bicep plan, then wait for my review.
+> You are the implementer for `appadino-discovery`, working from `discovery-phase1-implementation-brief-v2.3.md` at repo root. Work gate by gate (§8), strictly in sequence, one scoped commit per gate item, conventional commit messages. Never start the next gate before I approve the current one. My sessions are irregular and may be days apart: end every gate with passing tests, a clean `main`, and an updated `STATUS.md` (done / next / open questions / decisions awaiting me) — assume the next session starts cold from that file. Python 3.12, type-hinted, pytest per module; infra as Bicep in `/infra`; config never hardcoded — everything tenant-variable lives in `icp_configs.config`. The hard rules in §9 are test cases first. The enrichment stage (§5.5, gates E1/E2) is candidate scope: write zero enrichment code unless I explicitly open gate E1. Start with G1.1: propose the repo layout and the Bicep plan, then wait for my review.
 
 ---
-*Owner: Duan Walker, Appadino AI LLC · Architect of record: Claude · v2.2, September 2026 (supersedes v2.1 — FullEnrich starter tier switched to the $500/12,500-credit one-time pack)*
+*Owner: Duan Walker, Appadino AI LLC · Architect of record: Claude · v2.4, September 2026 (supersedes v2.3 — stale_likely_moved status and the real-vs-verified confidence signal, both already flagged in STATUS.md as carried into E2, actually written into the brief)*
