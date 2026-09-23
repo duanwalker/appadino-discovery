@@ -11,22 +11,31 @@ nullable, and a filing this stage can't resolve or parse is counted, not fatal.
 from __future__ import annotations
 
 import logging
+import os
 import re
-from collections.abc import Iterable
+import zipfile
+from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
 import httpx
 import psycopg
 from psycopg.types.json import Json
-from remotezip import RemoteZip
+
+from discovery.stages.ingest import default_target_years
 
 logger = logging.getLogger(__name__)
 
 ARCHIVE_URL_TEMPLATE = "https://apps.irs.gov/pub/epostcard/990/xml/{year}/{filename}"
 MONTHS = range(1, 13)
 SUFFIXES = ("A", "B", "C", "D")
+
+# Container Apps Job mount path for the Azure Files-backed archive cache (see
+# infra/modules/storage.bicep); overridable via ARCHIVE_CACHE_DIR for local/dev runs
+# where nothing is mounted at that path.
+DEFAULT_ARCHIVE_CACHE_DIR = "/mnt/irs-archive-cache"
 
 # Confirmed against real filings (see STATUS.md / commit notes) rather than guessed
 # from IRS schema docs alone. CY* = current-year values on the Form 990 Part I summary;
@@ -275,37 +284,177 @@ def _year_from_archive_url(xml_object_url: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _probe_month(
+    client: httpx.Client, year: int, month: int, known_suffixes: frozenset[str] = frozenset()
+) -> Iterator[tuple[str, str]]:
+    """Yields (suffix, url) for each shard confirmed to exist this call via a HEAD
+    request, skipping any suffix already in `known_suffixes` (no HEAD call for it —
+    it's already confirmed, either earlier this call or by a prior manifest sync).
+    Stops probing the month once suffix "A" comes back non-200 and wasn't already
+    known — matches the real IRS archive layout: a month with zero shards published
+    yet never has a B/C/D either, so there's no point checking further.
+    """
+    for suffix in SUFFIXES:
+        if suffix in known_suffixes:
+            continue
+        filename = f"{year}_TEOS_XML_{month:02d}{suffix}.zip"
+        url = ARCHIVE_URL_TEMPLATE.format(year=year, filename=filename)
+        response = client.head(url)
+        if response.status_code == 200:
+            yield suffix, url
+        elif suffix == "A":
+            break
+
+
 def discover_zip_urls(client: httpx.Client, year: int) -> list[str]:
     """Enumerate the monthly ZIP archives that actually exist for a submission year
     (naming: `{year}_TEOS_XML_{MM}{A-D}.zip`) via cheap HEAD requests — no full
     downloads. Confirmed against apps.irs.gov; see pipeline/README.md.
     """
-    urls = []
+    return [url for month in MONTHS for _suffix, url in _probe_month(client, year, month)]
+
+
+def _known_manifest_shards(conn: psycopg.Connection, year: int) -> dict[int, dict[str, dict[str, Any]]]:
+    """month -> {suffix: {"url", "local_path", "size_bytes"}} for this year's rows
+    already recorded in archive_manifest."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT month, suffix, url, local_path, size_bytes FROM archive_manifest WHERE year = %s",
+            (year,),
+        )
+        rows = cur.fetchall()
+    known: dict[int, dict[str, dict[str, Any]]] = {}
+    for month, suffix, url, local_path, size_bytes in rows:
+        known.setdefault(month, {})[suffix] = {
+            "url": url,
+            "local_path": local_path,
+            "size_bytes": size_bytes,
+        }
+    return known
+
+
+def _probe_new_shards(
+    client: httpx.Client, year: int, known: dict[int, dict[str, dict[str, Any]]]
+) -> list[tuple[int, str, str]]:
+    """(month, suffix, url) triples for shards IRS has published that archive_manifest
+    doesn't have yet — reuses _probe_month's A->B->C->D logic per month, skipping a
+    HEAD call for any suffix the manifest already knows about."""
+    new_shards: list[tuple[int, str, str]] = []
     for month in MONTHS:
-        for suffix in SUFFIXES:
+        known_suffixes = frozenset(known.get(month, {}))
+        for suffix, url in _probe_month(client, year, month, known_suffixes):
+            new_shards.append((month, suffix, url))
+    return new_shards
+
+
+def _sanity_check_manifest(
+    client: httpx.Client, year: int, known: dict[int, dict[str, dict[str, Any]]]
+) -> None:
+    """Cheap sanity check for shards already in the manifest (never re-downloaded):
+    a fresh HEAD's Content-Length should still match what's on disk. A mismatch would
+    mean the IRS silently replaced a "confirmed immutable" archive out from under us
+    — log it as a warning to investigate, don't crash the run over it.
+    """
+    for month, suffixes in known.items():
+        for suffix, entry in suffixes.items():
             filename = f"{year}_TEOS_XML_{month:02d}{suffix}.zip"
             url = ARCHIVE_URL_TEMPLATE.format(year=year, filename=filename)
             response = client.head(url)
-            if response.status_code == 200:
-                urls.append(url)
-            elif suffix == "A":
-                break
-    return urls
+            if response.status_code != 200:
+                continue
+            remote_length = response.headers.get("content-length")
+            if remote_length is None:
+                continue
+            if int(remote_length) != entry["size_bytes"]:
+                logger.warning(
+                    "ARCHIVE_SIZE_MISMATCH year=%s month=%s suffix=%s manifest_size=%s remote_size=%s url=%s",
+                    year,
+                    month,
+                    suffix,
+                    entry["size_bytes"],
+                    remote_length,
+                    url,
+                )
 
 
-def build_year_index(client: httpx.Client, year: int) -> dict[str, tuple[str, str]]:
-    """Maps object_id -> (zip_url, member_name) for every filing submitted in `year`,
-    reading only each archive's central directory (via remotezip range requests) —
-    not the archives themselves. Built once per year, shared across all survivors.
+def _download_archive_to(client: httpx.Client, url: str, local_path: Path) -> int:
+    """Streams `url` to `local_path` (via a .part temp file, renamed on success so a
+    crash mid-download never leaves a file that looks complete) and returns its size
+    in bytes."""
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = local_path.with_name(local_path.name + ".part")
+    with client.stream("GET", url) as response:
+        response.raise_for_status()
+        with open(tmp_path, "wb") as f:
+            f.writelines(response.iter_bytes())
+    tmp_path.replace(local_path)
+    return local_path.stat().st_size
+
+
+def _insert_manifest_row(
+    conn: psycopg.Connection, year: int, month: int, suffix: str, url: str, local_path: str, size_bytes: int
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO archive_manifest (year, month, suffix, url, local_path, size_bytes, downloaded_at)
+            VALUES (%(year)s, %(month)s, %(suffix)s, %(url)s, %(local_path)s, %(size_bytes)s, %(downloaded_at)s)
+            ON CONFLICT (year, month, suffix) DO NOTHING
+            """,
+            {
+                "year": year,
+                "month": month,
+                "suffix": suffix,
+                "url": url,
+                "local_path": local_path,
+                "size_bytes": size_bytes,
+                "downloaded_at": datetime.now(UTC),
+            },
+        )
+    conn.commit()
+
+
+def sync_archive_manifest(
+    client: httpx.Client, conn: psycopg.Connection, years: Iterable[int], cache_dir: str | Path
+) -> None:
+    """Ensures every shard IRS has published for `years` is downloaded to `cache_dir`
+    and recorded in archive_manifest. Existing rows are immutable — never
+    re-downloaded, only sanity-checked (see _sanity_check_manifest). Run at the start
+    of every extract_signals_for_survivors() call, across every year currently in
+    default_target_years() — not just the years this run's survivors happen to need —
+    so the manifest stays current with what IRS has published even for a year with no
+    survivor filings yet this run.
     """
+    cache_dir = Path(cache_dir)
+    for year in years:
+        known = _known_manifest_shards(conn, year)
+        _sanity_check_manifest(client, year, known)
+        for month, suffix, url in _probe_new_shards(client, year, known):
+            filename = f"{year}_TEOS_XML_{month:02d}{suffix}.zip"
+            local_path = cache_dir / str(year) / filename
+            size_bytes = _download_archive_to(client, url, local_path)
+            _insert_manifest_row(conn, year, month, suffix, url, str(local_path), size_bytes)
+
+
+def build_year_index(conn: psycopg.Connection, year: int) -> dict[str, tuple[str, str]]:
+    """Maps object_id -> (local_path, member_name) for every filing submitted in
+    `year`, reading each archive's central directory from the local cache (no network
+    calls) — sync_archive_manifest() must have already downloaded every shard for
+    this year and recorded it in archive_manifest before this runs. Built once per
+    year, shared across all survivors.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT local_path FROM archive_manifest WHERE year = %s", (year,))
+        local_paths = [row[0] for row in cur.fetchall()]
+
     index: dict[str, tuple[str, str]] = {}
-    for zip_url in discover_zip_urls(client, year):
-        with RemoteZip(zip_url) as archive:
+    for local_path in local_paths:
+        with zipfile.ZipFile(local_path) as archive:
             for member in archive.namelist():
                 if not member.endswith("_public.xml"):
                     continue
                 object_id = member.rsplit("/", 1)[-1].removesuffix("_public.xml")
-                index[object_id] = (zip_url, member)
+                index[object_id] = (local_path, member)
     return index
 
 
@@ -313,8 +462,8 @@ def fetch_filing_xml(year_index: dict[str, tuple[str, str]], object_id: str) -> 
     entry = year_index.get(object_id)
     if entry is None:
         return None
-    zip_url, member = entry
-    with RemoteZip(zip_url) as archive:
+    local_path, member = entry
+    with zipfile.ZipFile(local_path) as archive:
         data: bytes = archive.read(member)
         return data
 
@@ -382,7 +531,9 @@ def _upsert_signal(conn: psycopg.Connection, ein: str, tax_year: int, signal: di
     conn.commit()
 
 
-def extract_signals_for_survivors(database_url: str, eins: Iterable[str]) -> dict[str, Any]:
+def extract_signals_for_survivors(
+    database_url: str, eins: Iterable[str], cache_dir: str | None = None
+) -> dict[str, Any]:
     """Stage 2 orchestrator (§4): resolves + parses each survivor's up-to-2 filings and
     computes derived signals. Commits per filing/signal, not once at the end, so a run
     interrupted partway through loses no completed work on restart.
@@ -390,8 +541,11 @@ def extract_signals_for_survivors(database_url: str, eins: Iterable[str]) -> dic
     eins = list(eins)
     counts: dict[str, Any] = {"filings_parsed": 0, "filings_failed": 0, "signals_computed": 0}
     year_indexes: dict[int, dict[str, tuple[str, str]]] = {}
+    cache_dir = cache_dir or os.environ.get("ARCHIVE_CACHE_DIR", DEFAULT_ARCHIVE_CACHE_DIR)
 
     with httpx.Client(timeout=60.0) as client, psycopg.connect(database_url) as conn:
+        sync_archive_manifest(client, conn, default_target_years(), cache_dir)
+
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, ein, tax_year, object_id, xml_object_url FROM filings "
@@ -408,7 +562,7 @@ def extract_signals_for_survivors(database_url: str, eins: Iterable[str]) -> dic
                 counts["filings_failed"] += 1
                 continue
             if year not in year_indexes:
-                year_indexes[year] = build_year_index(client, year)
+                year_indexes[year] = build_year_index(conn, year)
 
             try:
                 xml_bytes = fetch_filing_xml(year_indexes[year], object_id)

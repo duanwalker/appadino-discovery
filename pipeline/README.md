@@ -55,12 +55,16 @@ Takes roughly 15-20 minutes end to end (national BMF is ~2M orgs; the 990 index 
 Stage 1 reads the client's active `icp_configs` row and runs a config-driven SQL recall filter
 over `organizations`/`filings` (revenue band, foundation-code and NTEE-prefix excludes) — no AI,
 no network calls. Stage 2 then resolves each survivor's up-to-2 filings to their IRS 990 e-file
-monthly ZIP archive (the old per-filing S3 URLs were deprecated Dec 2021 — see
-`discovery.stages.extract_signals` for how archive/member lookup works via `remotezip` range
-requests), parses the XML, fills in `filings`' financial columns, and computes derived signals into
-`signals`. Every filing that can't be resolved or parsed (unsupported ZIP compression, schema
-variance, network errors) is counted, not fatal — the run logs a `coverage_pct` so degraded
-extraction is visible without failing the job (§10).
+monthly ZIP archive (the old per-filing S3 URLs were deprecated Dec 2021). Every archive IRS has
+published for `default_target_years()` is downloaded once to a local cache — an Azure Files share
+mounted at `ARCHIVE_CACHE_DIR` (default `/mnt/irs-archive-cache`) in production — and recorded in
+the `archive_manifest` table; see `discovery.stages.extract_signals.sync_archive_manifest` for the
+probe/download/sanity-check logic. Filing lookups then read the local copy via stdlib `zipfile`
+instead of opening a fresh remote connection per filing. Stage 2 parses the XML, fills in
+`filings`' financial columns, and computes derived signals into `signals`. Every filing that can't
+be resolved or parsed (unsupported ZIP compression, schema variance, network errors) is counted,
+not fatal — the run logs a `coverage_pct` so degraded extraction is visible without failing the
+job (§10).
 
 Only the ARCHITECT client (`client_id=2` in the dev DB) has a seeded `icp_configs` row so far.
 

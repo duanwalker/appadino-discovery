@@ -314,7 +314,10 @@ def test_stage2_coverage_pct_is_now_survivor_based(monkeypatch: pytest.MonkeyPat
     )
     monkeypatch.setattr(extract_signals.psycopg, "connect", lambda _database_url: fake_connection)
     monkeypatch.setattr(extract_signals.httpx, "Client", lambda **_kwargs: NullHttpClient())
-    monkeypatch.setattr(extract_signals, "build_year_index", lambda _client, _year: {})
+    monkeypatch.setattr(
+        extract_signals, "sync_archive_manifest", lambda _client, _conn, _years, _cache_dir: None
+    )
+    monkeypatch.setattr(extract_signals, "build_year_index", lambda _conn, _year: {})
     monkeypatch.setattr(
         extract_signals,
         "fetch_filing_xml",

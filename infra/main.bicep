@@ -82,6 +82,15 @@ module alerts 'modules/alerts.bicep' = {
   }
 }
 
+module storage 'modules/storage.bicep' = {
+  name: 'storage'
+  params: {
+    location: location
+    namePrefix: namePrefix
+    containerAppsEnvironmentName: containerAppsEnv.outputs.name
+  }
+}
+
 module containerAppsJob 'modules/containerAppsJob.bicep' = {
   name: 'containerAppsJob'
   params: {
@@ -92,6 +101,7 @@ module containerAppsJob 'modules/containerAppsJob.bicep' = {
     acrLoginServer: acr.outputs.loginServer
     acrName: acr.outputs.name
     image: '${acr.outputs.loginServer}/discovery-pipeline:${pipelineImageTag}'
+    archiveCacheEnvStorageName: storage.outputs.envStorageName
   }
   dependsOn: [
     keyVault

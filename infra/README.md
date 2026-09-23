@@ -36,6 +36,7 @@ is supplied only at deploy time.
 | `adisc-dev-ai` | Application Insights, wired to the same Log Analytics workspace |
 | `adiscdevacr` | Container Registry (Basic), holds the `discovery-pipeline` image |
 | `adisc-dev-pipeline-job` | Container Apps Job, monthly cron. Runs `adiscdevacr.azurecr.io/discovery-pipeline:latest` — Stage 0 ingest (§4) as of G1.2 |
+| `adiscdevarchive` | Storage Account (Standard_LRS) — `irs-archive-cache` Azure Files share, 200GiB quota, registered with `adisc-dev-cae` and mounted into the pipeline job at `/mnt/irs-archive-cache` (Stage 2 archive-manifest cache, see `pipeline/README.md`) |
 | `adisc-dev-ops-ag` | Action group — email alert notifications (§7) |
 | `adisc-dev-run-failed-alert` / `adisc-dev-zero-output-alert` / `adisc-dev-qa-mismatch-alert` | Scheduled query rules (G1.5) watching `ContainerAppConsoleLogs_CL` (confirmed against real pipeline logs) for the `RUN_FAILED`/`ZERO_OUTPUT_RUN`/`QA_MISMATCH_RATE_EXCEEDED` markers each orchestrator logs. §7's third alert category, cost anomalies, isn't implemented — no historical cost baseline exists yet to detect an anomaly against (flagged in STATUS.md) |
 
@@ -55,6 +56,40 @@ everything else, build+push the image, then re-run the same deploy command.
 ```powershell
 az keyvault secret set --vault-name adisc-dev-kv --name appadino-discoveryAI-key --value <key>
 ```
+
+## Archive cache Storage Account (Stage 2 performance fix)
+
+`storage.bicep` creates and wires up `adiscdevarchive` + its `irs-archive-cache` file share via the
+same `az deployment group create` command as everything else — nothing extra to run. The raw `az`
+commands it's equivalent to, for reference / manual verification:
+
+```powershell
+$rg = "rg-appadino-discovery-dev"
+
+# Storage account (Standard_LRS — this is a cache, not a durability-critical store)
+az storage account create `
+  -g $rg -n adiscdevarchive -l eastus2 `
+  --sku Standard_LRS --kind StorageV2 `
+  --min-tls-version TLS1_2 --allow-blob-public-access false
+
+# File share — 200GiB quota, headroom over the ~11GB rolling 3-year working set
+# sized 2026-09-22 (see STATUS.md)
+$key = az storage account keys list -g $rg -n adiscdevarchive --query "[0].value" -o tsv
+az storage share create --account-name adiscdevarchive --account-key $key `
+  --name irs-archive-cache --quota 200
+
+# Register the share with the Container Apps environment so the job can mount it
+az containerapp env storage set `
+  -g $rg -n adisc-dev-cae --storage-name archive-cache `
+  --azure-file-account-name adiscdevarchive --azure-file-account-key $key `
+  --azure-file-share-name irs-archive-cache --access-mode ReadWrite
+```
+
+The job's container gets an `archive-cache` volume mounted at `/mnt/irs-archive-cache` (the same
+path `ARCHIVE_CACHE_DIR` defaults to in `extract_signals.py`) and picks up `ARCHIVE_CACHE_DIR` as
+a plain env var pointing at that mount — no code change needed between local dev (env var unset,
+falls back to a path that won't exist, so nothing downloads without it actually being set) and
+production (env var set to the mount path by the job template).
 
 ## CI/CD deploy
 

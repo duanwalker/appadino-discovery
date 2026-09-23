@@ -22,6 +22,12 @@ param acrName string
 @description('Pipeline container image, including tag, e.g. adiscdevacr.azurecr.io/discovery-pipeline:latest')
 param image string
 
+@description('Name of the Container Apps environment storage resource (storage.bicep) backing the archive cache volume')
+param archiveCacheEnvStorageName string
+
+@description('Path the archive cache volume is mounted at inside the pipeline container — must match ARCHIVE_CACHE_DIR')
+param archiveCacheMountPath string = '/mnt/irs-archive-cache'
+
 var keyVaultSecretsUserRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
 var acrPullRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
 
@@ -94,11 +100,30 @@ resource job 'Microsoft.App/jobs@2023-05-01' = {
               name: 'ANTHROPIC_API_KEY'
               secretRef: 'anthropic-api-key'
             }
+            {
+              // Picked up by extract_signals.py's ARCHIVE_CACHE_DIR fallback — keep in
+              // sync with archiveCacheMountPath below, the two must always match.
+              name: 'ARCHIVE_CACHE_DIR'
+              value: archiveCacheMountPath
+            }
           ]
           resources: {
             cpu: json('1.0')
             memory: '2Gi'
           }
+          volumeMounts: [
+            {
+              volumeName: 'archive-cache'
+              mountPath: archiveCacheMountPath
+            }
+          ]
+        }
+      ]
+      volumes: [
+        {
+          name: 'archive-cache'
+          storageType: 'AzureFile'
+          storageName: archiveCacheEnvStorageName
         }
       ]
     }
