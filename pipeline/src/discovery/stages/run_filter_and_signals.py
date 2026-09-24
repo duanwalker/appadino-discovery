@@ -1,6 +1,17 @@
-"""Orchestrates Stage 1 (filter.py) + Stage 2 (extract_signals.py) as one G1.3 run,
-logged to `runs` the same way Stage 0's ingest is (§7) — the automated stand-in for
-"Duan reads the output".
+"""Orchestrates Stage 1 (filter.py) + an early EIN-exact suppression gate + Stage 2
+(extract_signals.py) as one G1.3 run, logged to `runs` the same way Stage 0's ingest
+is (§7) — the automated stand-in for "Duan reads the output".
+
+The suppression gate calls Stage 4's apply_suppression() (suppress.py) right after
+Stage 1, before Stage 2/3 ever run — an EIN-exact match to an existing ARCHITECT
+client/prospect is real, known information the moment Stage 1 produces it; there's no
+reason to pay for extraction or a real Sonnet scoring call on an org that's already
+going to be suppressed. Fuzzy name matches are NOT dropped here: Lauren's rule is
+that a fuzzy match gets flagged for human review, never silently excluded, which
+requires the org to go through full extraction and scoring so a reviewer has real
+data to look at. apply_suppression() is called again, unchanged, at Publish (Stage
+6) — cheap to recompute, and it's what actually sets prospects.suppression_flag on
+whatever made it through scoring.
 """
 
 from __future__ import annotations
@@ -15,6 +26,7 @@ from psycopg.types.json import Json
 
 from discovery.stages.extract_signals import extract_signals_for_survivors
 from discovery.stages.filter import select_survivor_eins
+from discovery.stages.suppress import apply_suppression
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +55,19 @@ def run_filter_and_signals(client_id: int, database_url: str | None = None) -> d
     try:
         with psycopg.connect(database_url) as conn:
             survivor_eins = select_survivor_eins(conn, client_id)
-        counts["survivors"] = len(survivor_eins)
-        logger.info("Stage 1: %d survivors for client_id=%s", len(survivor_eins), client_id)
+            counts["survivors"] = len(survivor_eins)
+            logger.info("Stage 1: %d survivors for client_id=%s", len(survivor_eins), client_id)
 
-        signal_counts = extract_signals_for_survivors(database_url, survivor_eins)
+            remaining_eins, fuzzy_flags = apply_suppression(conn, client_id, survivor_eins)
+        counts["ein_suppressed_pre_extraction"] = len(survivor_eins) - len(remaining_eins)
+        counts["fuzzy_flagged_pre_extraction"] = len(fuzzy_flags)
+        logger.info(
+            "Suppression (pre-Stage2): %d EIN-exact suppressed, %d fuzzy-flagged (continuing to Stage 2/3)",
+            counts["ein_suppressed_pre_extraction"],
+            counts["fuzzy_flagged_pre_extraction"],
+        )
+
+        signal_counts = extract_signals_for_survivors(database_url, remaining_eins)
         counts.update(signal_counts)
         logger.info("Stage 2: %s", signal_counts)
     except Exception as exc:
