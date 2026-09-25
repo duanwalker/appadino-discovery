@@ -98,7 +98,9 @@ def test_ein_exact_match_never_reaches_extract_signals_input(monkeypatch: pytest
     survivor_eins = ["111111111", "222222222", "333333333"]
     captured_extract_calls: list[list[str]] = []
 
-    monkeypatch.setattr(run_filter_and_signals.psycopg, "connect", lambda _database_url: fake_conn)
+    monkeypatch.setattr(
+        "discovery.stages.run_filter_and_signals.psycopg.connect", lambda _database_url: fake_conn
+    )
     monkeypatch.setattr(run_filter_and_signals, "select_survivor_eins", lambda _conn, _client_id: survivor_eins)
     monkeypatch.setattr(
         run_filter_and_signals,
@@ -128,7 +130,9 @@ def test_no_suppression_matches_passes_full_survivor_set_through(monkeypatch: py
     survivor_eins = ["444444444"]
     captured_extract_calls: list[list[str]] = []
 
-    monkeypatch.setattr(run_filter_and_signals.psycopg, "connect", lambda _database_url: fake_conn)
+    monkeypatch.setattr(
+        "discovery.stages.run_filter_and_signals.psycopg.connect", lambda _database_url: fake_conn
+    )
     monkeypatch.setattr(run_filter_and_signals, "select_survivor_eins", lambda _conn, _client_id: survivor_eins)
     monkeypatch.setattr(
         run_filter_and_signals,
