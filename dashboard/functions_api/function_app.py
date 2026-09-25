@@ -787,3 +787,13 @@ def list_runs(req: func.HttpRequest) -> func.HttpResponse:
         cur.execute(query, params)
         rows = cur.fetchall()
     return _json_response(rows)
+
+
+@app.route(route="clients", methods=["GET"])
+def list_clients(req: func.HttpRequest) -> func.HttpResponse:
+    """Internal dev tool for the dashboard's client switcher (no auth in this app
+    today — see App.tsx). Unfiltered on purpose: every row, every caller."""
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT id, name FROM clients ORDER BY id")
+        rows = cur.fetchall()
+    return _json_response(rows)

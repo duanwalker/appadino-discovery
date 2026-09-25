@@ -25,6 +25,7 @@ from function_app import (
     create_suppression,
     delete_suppression,
     export_csv,
+    list_clients,
     list_prospects,
     list_runs,
     list_suppression,
@@ -183,6 +184,17 @@ class TestFunctionsApiMalformedInput:
         response = list_runs(_request("GET", "/api/runs", params={"client_id": "2", "limit": "many"}))
         assert response.status_code == 400
         assert _json_body(response) == {"error": "limit must be an integer"}
+
+    def test_list_clients_returns_every_row_unfiltered(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        conn = RouteConnection(fetchall=[{"id": 2, "name": "ARCHITECT Philanthropic Collective"}, {"id": 3, "name": "INTERNAL QA"}])
+        monkeypatch.setattr("function_app._conn", lambda: conn)
+        response = list_clients(_request("GET", "/api/clients"))
+        assert response.status_code == 200
+        assert _json_body(response) == [
+            {"id": 2, "name": "ARCHITECT Philanthropic Collective"},
+            {"id": 3, "name": "INTERNAL QA"},
+        ]
+        assert conn.executed[0].params is None
 
 
 def test_dismiss_suppression_flag_only_clears_prospect_flag_not_suppression_rows(monkeypatch: pytest.MonkeyPatch) -> None:

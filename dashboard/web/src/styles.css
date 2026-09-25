@@ -43,6 +43,13 @@ body {
   margin: 0;
 }
 
+.app-header__controls {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
+.app-header__client,
 .app-header__reviewer {
   display: flex;
   align-items: center;
@@ -51,6 +58,7 @@ body {
   color: var(--color-text-muted);
 }
 
+.app-header__client select,
 .app-header__reviewer input {
   padding: 6px 10px;
   border: 1px solid var(--color-border);

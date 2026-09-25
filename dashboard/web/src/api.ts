@@ -1,4 +1,4 @@
-import type { Prospect, ProspectStatus, Run, SuppressionEntry } from "./types";
+import type { Client, Prospect, ProspectStatus, Run, SuppressionEntry } from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
@@ -10,6 +10,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(body.error || `${res.status} ${res.statusText}`);
   }
   return res.json() as Promise<T>;
+}
+
+// Internal dev tool, not customer-facing — see function_app.py's list_clients.
+// No auth exists anywhere in this app yet; this is a bare mechanism for one
+// operator to pick which client_id's data to view during testing.
+export function fetchClients(): Promise<Client[]> {
+  return request(`/api/clients`);
 }
 
 export function fetchProspects(clientId: number): Promise<Prospect[]> {

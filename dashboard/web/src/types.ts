@@ -114,6 +114,11 @@ export interface SuppressionEntry {
   partner_window_expires_at: string | null;
 }
 
+export interface Client {
+  id: number;
+  name: string;
+}
+
 export interface Run {
   id: number;
   client_id: number | null;
