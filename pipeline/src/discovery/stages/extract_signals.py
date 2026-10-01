@@ -13,8 +13,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 import zipfile
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,83 @@ from psycopg.types.json import Json
 from discovery.stages.ingest import default_target_years
 
 logger = logging.getLogger(__name__)
+
+# National-scale Stage 2 runs (119k+ survivors) processed 990-XML filings for hours
+# on a single psycopg connection, and a Postgres Flexible Server public endpoint
+# eventually dropped it mid-run ("server closed the connection unexpectedly") —
+# investigation found no single configured timeout responsible (server-side
+# idle_in_transaction_session_timeout/statement_timeout are both off; there's no
+# NAT gateway or proxy in this deployment's path), so a multi-hour run just can't
+# assume one TCP connection survives it. _ReconnectingConnection below cycles the
+# connection proactively and retries through drops instead.
+STAGE2_RECONNECT_EVERY_FILINGS = 2000
+STAGE2_MAX_RETRIES = 5
+STAGE2_RETRY_BACKOFF_SECONDS = 2.0
+STAGE2_MAX_RETRY_BACKOFF_SECONDS = 30.0
+
+# A national run's per-filing loop can run for hours with no other output — logged
+# periodically so it's visible from Container Apps Job logs that the run is actually
+# progressing, not hung, without spamming a log line per filing.
+STAGE2_PROGRESS_LOG_EVERY_FILINGS = 5000
+
+
+class _ReconnectingConnection:
+    """Wraps a single psycopg connection for a long Stage 2 run, transparently
+    reconnecting on a dropped connection and cycling the connection periodically even
+    absent errors. Safe because every write in this module commits immediately (see
+    extract_signals_for_survivors docstring) — retrying a call after a reconnect just
+    re-issues one already-idempotent statement (UPDATE by id, or INSERT ... ON
+    CONFLICT), never replays completed work.
+    """
+
+    def __init__(self, database_url: str) -> None:
+        self._database_url = database_url
+        self.conn = psycopg.connect(database_url)
+        self._filings_since_reconnect = 0
+
+    def run(self, fn: Callable[[psycopg.Connection], Any]) -> Any:
+        for attempt in range(STAGE2_MAX_RETRIES + 1):
+            try:
+                return fn(self.conn)
+            except psycopg.OperationalError:
+                if attempt == STAGE2_MAX_RETRIES:
+                    raise
+                backoff = min(STAGE2_RETRY_BACKOFF_SECONDS * (2**attempt), STAGE2_MAX_RETRY_BACKOFF_SECONDS)
+                logger.warning(
+                    "Stage 2 DB connection dropped (attempt %d/%d), reconnecting in %.0fs",
+                    attempt + 1,
+                    STAGE2_MAX_RETRIES,
+                    backoff,
+                    exc_info=True,
+                )
+                time.sleep(backoff)
+                self._reconnect()
+        raise AssertionError("unreachable")
+
+    def tick(self) -> None:
+        """Call once per filing processed; proactively cycles the connection every
+        STAGE2_RECONNECT_EVERY_FILINGS filings so a multi-hour run never depends on
+        one connection surviving the whole thing."""
+        self._filings_since_reconnect += 1
+        if self._filings_since_reconnect >= STAGE2_RECONNECT_EVERY_FILINGS:
+            self._reconnect()
+
+    def _reconnect(self) -> None:
+        # The old connection is already dead in the case we care about here; closing
+        # it is best-effort cleanup, not something worth failing over.
+        try:
+            self.conn.close()
+        except psycopg.Error:
+            logger.debug("ignoring error while closing dropped Stage 2 connection", exc_info=True)
+        self.conn = psycopg.connect(self._database_url)
+        self._filings_since_reconnect = 0
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except psycopg.Error:
+            logger.debug("ignoring error while closing Stage 2 connection", exc_info=True)
+
 
 ARCHIVE_URL_TEMPLATE = "https://apps.irs.gov/pub/epostcard/990/xml/{year}/{filename}"
 MONTHS = range(1, 13)
@@ -531,73 +609,102 @@ def _upsert_signal(conn: psycopg.Connection, ein: str, tax_year: int, signal: di
     conn.commit()
 
 
+def _select_filing_rows(conn: psycopg.Connection, eins: list[str]) -> list[tuple[Any, ...]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, ein, tax_year, object_id, xml_object_url FROM filings "
+            "WHERE ein = ANY(%s) ORDER BY ein, tax_year DESC",
+            (eins,),
+        )
+        return cur.fetchall()
+
+
 def extract_signals_for_survivors(
     database_url: str, eins: Iterable[str], cache_dir: str | None = None
 ) -> dict[str, Any]:
     """Stage 2 orchestrator (§4): resolves + parses each survivor's up-to-2 filings and
     computes derived signals. Commits per filing/signal, not once at the end, so a run
     interrupted partway through loses no completed work on restart.
+
+    Holds no single connection for the whole run: DB calls go through
+    _ReconnectingConnection, which retries a dropped connection with backoff and
+    proactively cycles the connection every STAGE2_RECONNECT_EVERY_FILINGS filings —
+    needed at national scale (100k+ survivors), where a run spans hours and a single
+    long-lived connection isn't a safe assumption (see module comment above).
     """
     eins = list(eins)
     counts: dict[str, Any] = {"filings_parsed": 0, "filings_failed": 0, "signals_computed": 0}
     year_indexes: dict[int, dict[str, tuple[str, str]]] = {}
     cache_dir = cache_dir or os.environ.get("ARCHIVE_CACHE_DIR", DEFAULT_ARCHIVE_CACHE_DIR)
 
-    with httpx.Client(timeout=60.0) as client, psycopg.connect(database_url) as conn:
-        sync_archive_manifest(client, conn, default_target_years(), cache_dir)
+    db = _ReconnectingConnection(database_url)
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            db.run(lambda conn: sync_archive_manifest(client, conn, default_target_years(), cache_dir))
 
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, ein, tax_year, object_id, xml_object_url FROM filings "
-                "WHERE ein = ANY(%s) ORDER BY ein, tax_year DESC",
-                (eins,),
-            )
-            filing_rows = cur.fetchall()
+            filing_rows = db.run(lambda conn: _select_filing_rows(conn, eins))
+            logger.info("Stage 2: %d filing rows to process for %d survivors", len(filing_rows), len(eins))
 
-        parsed_by_ein: dict[str, list[dict[str, Any]]] = {}
-        website_backfilled: set[str] = set()
-        for filing_id, ein, tax_year, object_id, xml_object_url in filing_rows:
-            year = _year_from_archive_url(xml_object_url)
-            if year is None:
-                counts["filings_failed"] += 1
-                continue
-            if year not in year_indexes:
-                year_indexes[year] = build_year_index(conn, year)
-
-            try:
-                xml_bytes = fetch_filing_xml(year_indexes[year], object_id)
-                if xml_bytes is None:
+            parsed_by_ein: dict[str, list[dict[str, Any]]] = {}
+            website_backfilled: set[str] = set()
+            for filing_index, (filing_id, ein, tax_year, object_id, xml_object_url) in enumerate(filing_rows, start=1):
+                db.tick()
+                if filing_index % STAGE2_PROGRESS_LOG_EVERY_FILINGS == 0:
+                    logger.info(
+                        "Stage 2 progress: %d/%d filings processed (%d parsed, %d failed)",
+                        filing_index,
+                        len(filing_rows),
+                        counts["filings_parsed"],
+                        counts["filings_failed"],
+                    )
+                year = _year_from_archive_url(xml_object_url)
+                if year is None:
                     counts["filings_failed"] += 1
                     continue
-                parsed = parse_990_xml(xml_bytes)
-            except Exception:
-                # Tolerated per §10 (990 XML variance is expected): unsupported zip
-                # compression methods, corrupt archive entries, transient network
-                # errors, and malformed XML are all "this one filing didn't work",
-                # not "the run is broken" — count it and move on to the next filing.
-                logger.warning(
-                    "failed to fetch/parse filing ein=%s object_id=%s", ein, object_id, exc_info=True
-                )
-                counts["filings_failed"] += 1
-                continue
+                if year not in year_indexes:
+                    # db.run() invokes this immediately, within the same iteration, before
+                    # `year` can be reassigned — safe despite the closure-over-loop-variable
+                    # shape B023 normally warns about.
+                    year_indexes[year] = db.run(lambda conn: build_year_index(conn, year))  # noqa: B023
 
-            _update_filing(conn, filing_id, parsed)
-            counts["filings_parsed"] += 1
-            parsed_by_ein.setdefault(ein, []).append({**parsed, "tax_year": tax_year})
+                try:
+                    xml_bytes = fetch_filing_xml(year_indexes[year], object_id)
+                    if xml_bytes is None:
+                        counts["filings_failed"] += 1
+                        continue
+                    parsed = parse_990_xml(xml_bytes)
+                except Exception:
+                    # Tolerated per §10 (990 XML variance is expected): unsupported zip
+                    # compression methods, corrupt archive entries, transient network
+                    # errors, and malformed XML are all "this one filing didn't work",
+                    # not "the run is broken" — count it and move on to the next filing.
+                    logger.warning(
+                        "failed to fetch/parse filing ein=%s object_id=%s", ein, object_id, exc_info=True
+                    )
+                    counts["filings_failed"] += 1
+                    continue
 
-            # Rows arrive ordered ein, tax_year DESC — the first hit per ein is
-            # already the most recent filing, so only that one backfills the website.
-            if ein not in website_backfilled:
-                _update_organization_website(conn, ein, parsed["website"])
-                website_backfilled.add(ein)
+                db.run(lambda conn: _update_filing(conn, filing_id, parsed))  # noqa: B023
+                counts["filings_parsed"] += 1
+                parsed_by_ein.setdefault(ein, []).append({**parsed, "tax_year": tax_year})
 
-        for ein, filings in parsed_by_ein.items():
-            filings.sort(key=lambda f: f["tax_year"], reverse=True)
-            current, previous = filings[0], filings[1] if len(filings) > 1 else None
-            ruling_year = _get_ruling_year(conn, ein)
-            signal = compute_signals(current, previous, ruling_year, current["tax_year"])
-            _upsert_signal(conn, ein, current["tax_year"], signal)
-            counts["signals_computed"] += 1
+                # Rows arrive ordered ein, tax_year DESC — the first hit per ein is
+                # already the most recent filing, so only that one backfills the website.
+                if ein not in website_backfilled:
+                    website = parsed["website"]
+                    db.run(lambda conn: _update_organization_website(conn, ein, website))  # noqa: B023
+                    website_backfilled.add(ein)
+
+            for ein, filings in parsed_by_ein.items():
+                filings.sort(key=lambda f: f["tax_year"], reverse=True)
+                current, previous = filings[0], filings[1] if len(filings) > 1 else None
+                ruling_year = db.run(lambda conn: _get_ruling_year(conn, ein))  # noqa: B023
+                signal = compute_signals(current, previous, ruling_year, current["tax_year"])
+                tax_year = current["tax_year"]
+                db.run(lambda conn: _upsert_signal(conn, ein, tax_year, signal))  # noqa: B023
+                counts["signals_computed"] += 1
+    finally:
+        db.close()
 
     # §10 risk mitigation: "990 XML variance ... coverage % logged per run" — surfaces
     # tolerated failures (unsupported zip compression, unresolved archives, malformed

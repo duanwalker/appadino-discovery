@@ -293,6 +293,9 @@ def test_extract_signals_for_survivors_calls_sync_archive_manifest_before_readin
         def cursor(self) -> NullCursor:
             return NullCursor()
 
+        def close(self) -> None:
+            return None
+
         def __enter__(self) -> Self:
             return self
 

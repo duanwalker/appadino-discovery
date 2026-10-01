@@ -62,7 +62,12 @@ resource job 'Microsoft.App/jobs@2023-05-01' = {
         parallelism: 1
         replicaCompletionCount: 1
       }
-      replicaTimeout: 3600
+      // 4 hours — the prior 3600s (1hr) default was killing real Stage 2 national
+      // runs partway through (see extract_signals.py's Stage 2 connection-resilience
+      // comment): a platform-level kill mid-run can present as a dropped DB
+      // connection, indistinguishable from a genuine network blip without checking
+      // this setting specifically.
+      replicaTimeout: 14400
       replicaRetryLimit: 1
       registries: [
         {

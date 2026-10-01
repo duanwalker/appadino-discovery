@@ -383,6 +383,9 @@ class FakeConnection(AbstractContextManager["FakeConnection"]):
     def commit(self) -> None:
         return None
 
+    def close(self) -> None:
+        return None
+
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         return None
 
