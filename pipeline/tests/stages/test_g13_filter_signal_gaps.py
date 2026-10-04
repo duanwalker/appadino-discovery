@@ -306,9 +306,9 @@ def test_stage2_coverage_pct_is_now_survivor_based(monkeypatch: pytest.MonkeyPat
     signaled out of 3 total, not 2 filings parsed out of 3 filing attempts."""
     fake_connection = FakeConnection(
         filing_rows=[
-            (1, "111111111", 2023, "ok-current", "https://apps.irs.gov/pub/epostcard/990/xml/2024/"),
-            (2, "111111111", 2022, "ok-previous", "https://apps.irs.gov/pub/epostcard/990/xml/2023/"),
-            (3, "222222222", 2023, "missing", "https://apps.irs.gov/pub/epostcard/990/xml/2024/"),
+            (1, "111111111", 2023, "ok-current", "https://apps.irs.gov/pub/epostcard/990/xml/2024/", 2010),
+            (2, "111111111", 2022, "ok-previous", "https://apps.irs.gov/pub/epostcard/990/xml/2023/", 2010),
+            (3, "222222222", 2023, "missing", "https://apps.irs.gov/pub/epostcard/990/xml/2024/", 2012),
         ],
         ruling_years={"111111111": 2010, "222222222": 2012, "333333333": 2015},
     )
@@ -321,7 +321,7 @@ def test_stage2_coverage_pct_is_now_survivor_based(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(
         extract_signals,
         "fetch_filing_xml",
-        lambda _year_index, object_id: b"<xml />" if str(object_id).startswith("ok") else None,
+        lambda _year_index, object_id, _archive_cache=None: b"<xml />" if str(object_id).startswith("ok") else None,
     )
     monkeypatch.setattr(
         extract_signals,
@@ -397,6 +397,10 @@ class FakeCursor(AbstractContextManager["FakeCursor"]):
     def execute(self, sql: str, params: Any = None) -> None:
         self.connection.last_sql = sql
         self.connection.last_params = params
+
+    def executemany(self, sql: str, params_seq: Any = None) -> None:
+        self.connection.last_sql = sql
+        self.connection.last_params = params_seq
 
     def fetchall(self) -> list[tuple[Any, ...]]:
         if "FROM filings" in self.connection.last_sql and "object_id" in self.connection.last_sql:

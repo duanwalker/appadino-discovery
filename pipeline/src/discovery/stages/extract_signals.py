@@ -47,14 +47,31 @@ STAGE2_MAX_RETRY_BACKOFF_SECONDS = 30.0
 # progressing, not hung, without spamming a log line per filing.
 STAGE2_PROGRESS_LOG_EVERY_FILINGS = 5000
 
+# Filing UPDATEs / website backfill / signal upserts are buffered in Python and sent
+# as one batch (see _flush_stage2_batch) instead of one commit per filing — a national
+# run paid 243k individual round trips for this before. Flushed every this-many
+# filings, or at the very end of the run (whichever hits first); never split a signal
+# upsert across two batches from the EIN it was computed from (see
+# extract_signals_for_survivors docstring) — that's what the EIN-level resume check
+# below depends on.
+STAGE2_BATCH_COMMIT_EVERY_FILINGS = 500
+
+# Set STAGE2_TIMING=1 in the job's env to accumulate and log per-phase wall-clock
+# totals (zip open/read, parse_990_xml, DB batch commits) on the existing progress
+# log line — added to measure where national-scale time actually goes (STATUS.md)
+# without paying perf_counter() calls in the hot loop when it's off.
+STAGE2_TIMING_ENV_VAR = "STAGE2_TIMING"
+
 
 class _ReconnectingConnection:
     """Wraps a single psycopg connection for a long Stage 2 run, transparently
     reconnecting on a dropped connection and cycling the connection periodically even
-    absent errors. Safe because every write in this module commits immediately (see
-    extract_signals_for_survivors docstring) — retrying a call after a reconnect just
-    re-issues one already-idempotent statement (UPDATE by id, or INSERT ... ON
-    CONFLICT), never replays completed work.
+    absent errors. Safe even though writes are now batched (see
+    extract_signals_for_survivors / _flush_stage2_batch docstrings): a dropped
+    connection mid-batch leaves nothing committed (the transaction dies with the
+    connection), so retrying just re-issues the exact same batch of already-idempotent
+    statements (UPDATE by id, INSERT ... ON CONFLICT) from scratch — never a partial
+    replay, never duplicated work.
     """
 
     def __init__(self, database_url: str) -> None:
@@ -536,95 +553,164 @@ def build_year_index(conn: psycopg.Connection, year: int) -> dict[str, tuple[str
     return index
 
 
-def fetch_filing_xml(year_index: dict[str, tuple[str, str]], object_id: str) -> bytes | None:
+def fetch_filing_xml(
+    year_index: dict[str, tuple[str, str]],
+    object_id: str,
+    archive_cache: dict[str, zipfile.ZipFile] | None = None,
+) -> bytes | None:
+    """Reads one filing's XML bytes out of its archive. Opening a zipfile.ZipFile
+    re-parses that archive's whole central directory (confirmed locally: ~65ms on a
+    20k-member archive vs ~0.2ms to read a member off an already-open handle) — at
+    national scale this was reopening the same ~40 monthly archives on every single
+    filing. Pass a dict the caller keeps for the run's duration (closed when the run
+    ends) to open each archive once and reuse the handle; omitted (as in isolated
+    tests that call this directly), each call opens and closes its own handle,
+    matching the old per-call behavior exactly.
+    """
     entry = year_index.get(object_id)
     if entry is None:
         return None
     local_path, member = entry
-    with zipfile.ZipFile(local_path) as archive:
-        data: bytes = archive.read(member)
-        return data
+    if archive_cache is None:
+        with zipfile.ZipFile(local_path) as transient_archive:
+            data: bytes = transient_archive.read(member)
+            return data
+    cached_archive = archive_cache.get(local_path)
+    if cached_archive is None:
+        cached_archive = zipfile.ZipFile(local_path)
+        archive_cache[local_path] = cached_archive
+    return cached_archive.read(member)
 
 
-def _update_filing(conn: psycopg.Connection, filing_id: int, parsed: dict[str, Any]) -> None:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE filings SET
-                revenue_total = %(revenue_total)s,
-                contributions = %(contributions)s,
-                program_revenue = %(program_revenue)s,
-                govt_grants = %(govt_grants)s,
-                fundraising_expense = %(fundraising_expense)s,
-                officers = %(officers)s,
-                mission_text = %(mission_text)s,
-                program_text = %(program_text)s,
-                significant_change_ind = %(significant_change_ind)s,
-                extracted_at = %(extracted_at)s
-            WHERE id = %(id)s
-            """,
-            {
-                **parsed,
-                "officers": Json(parsed["officers"]),
-                "program_text": Json(parsed["program_text"]),
-                "extracted_at": datetime.now(UTC),
-                "id": filing_id,
-            },
-        )
+_FILING_UPDATE_SQL = """
+    UPDATE filings SET
+        revenue_total = %(revenue_total)s,
+        contributions = %(contributions)s,
+        program_revenue = %(program_revenue)s,
+        govt_grants = %(govt_grants)s,
+        fundraising_expense = %(fundraising_expense)s,
+        officers = %(officers)s,
+        mission_text = %(mission_text)s,
+        program_text = %(program_text)s,
+        significant_change_ind = %(significant_change_ind)s,
+        extracted_at = %(extracted_at)s
+    WHERE id = %(id)s
+"""
+
+_WEBSITE_UPDATE_SQL = "UPDATE organizations SET website = %(website)s WHERE ein = %(ein)s"
+
+_SIGNAL_UPSERT_SQL = """
+    INSERT INTO signals (ein, tax_year, signal, computed_at)
+    VALUES (%(ein)s, %(tax_year)s, %(signal)s, %(computed_at)s)
+    ON CONFLICT (ein, tax_year) DO UPDATE SET
+        signal = EXCLUDED.signal,
+        computed_at = EXCLUDED.computed_at
+"""
+
+
+def _filing_update_params(filing_id: int, parsed: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **parsed,
+        "officers": Json(parsed["officers"]),
+        "program_text": Json(parsed["program_text"]),
+        "extracted_at": datetime.now(UTC),
+        "id": filing_id,
+    }
+
+
+def _signal_upsert_params(ein: str, tax_year: int, signal: dict[str, Any]) -> dict[str, Any]:
+    return {"ein": ein, "tax_year": tax_year, "signal": Json(signal), "computed_at": datetime.now(UTC)}
+
+
+def _flush_stage2_batch(
+    conn: psycopg.Connection,
+    filing_updates: list[dict[str, Any]],
+    website_updates: list[dict[str, Any]],
+    signal_upserts: list[dict[str, Any]],
+) -> None:
+    """Sends a batch of Stage 2 writes as one transaction. Called with whatever is
+    pending at STAGE2_BATCH_COMMIT_EVERY_FILINGS filings or at the end of the run
+    (extract_signals_for_survivors) — never with a signal upsert queued ahead of the
+    filings rows it was computed from, since that's the invariant the EIN-level
+    resume check (an EIN with an existing signals row is skipped outright) depends
+    on: if a signals row is visible, the filings it came from are guaranteed
+    committed too, in this same transaction.
+    """
+    if filing_updates:
+        with conn.cursor() as cur:
+            cur.executemany(_FILING_UPDATE_SQL, filing_updates)
+    if website_updates:
+        with conn.cursor() as cur:
+            cur.executemany(_WEBSITE_UPDATE_SQL, website_updates)
+    if signal_upserts:
+        with conn.cursor() as cur:
+            cur.executemany(_SIGNAL_UPSERT_SQL, signal_upserts)
     conn.commit()
 
 
-def _update_organization_website(conn: psycopg.Connection, ein: str, website: str | None) -> None:
-    if website is None:
-        return
+def _select_eins_already_signaled(conn: psycopg.Connection, eins: list[str]) -> set[str]:
+    """EINs (from `eins`) that already have a signals row, for any tax_year — signals
+    has no client_id, so this is true regardless of which client/run computed it.
+    Used to skip already-processed EINs on resume (extract_signals_for_survivors);
+    `force_recompute=True` bypasses this entirely."""
     with conn.cursor() as cur:
-        cur.execute("UPDATE organizations SET website = %s WHERE ein = %s", (website, ein))
-    conn.commit()
-
-
-def _get_ruling_year(conn: psycopg.Connection, ein: str) -> int | None:
-    with conn.cursor() as cur:
-        cur.execute("SELECT ruling_year FROM organizations WHERE ein = %s", (ein,))
-        row = cur.fetchone()
-    return row[0] if row else None
-
-
-def _upsert_signal(conn: psycopg.Connection, ein: str, tax_year: int, signal: dict[str, Any]) -> None:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO signals (ein, tax_year, signal, computed_at)
-            VALUES (%(ein)s, %(tax_year)s, %(signal)s, %(computed_at)s)
-            ON CONFLICT (ein, tax_year) DO UPDATE SET
-                signal = EXCLUDED.signal,
-                computed_at = EXCLUDED.computed_at
-            """,
-            {
-                "ein": ein,
-                "tax_year": tax_year,
-                "signal": Json(signal),
-                "computed_at": datetime.now(UTC),
-            },
-        )
-    conn.commit()
+        cur.execute("SELECT DISTINCT ein FROM signals WHERE ein = ANY(%s)", (eins,))
+        return {row[0] for row in cur.fetchall()}
 
 
 def _select_filing_rows(conn: psycopg.Connection, eins: list[str]) -> list[tuple[Any, ...]]:
+    """Joins organizations for ruling_year so compute_signals' org_age input comes out
+    of this one query instead of a separate per-EIN round trip. LEFT JOIN (not INNER):
+    a filing row with no matching organizations row — shouldn't happen, but isn't
+    enforced by a DB constraint — still gets extracted/signaled with ruling_year=None
+    rather than silently vanishing from the result set."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, ein, tax_year, object_id, xml_object_url FROM filings "
-            "WHERE ein = ANY(%s) ORDER BY ein, tax_year DESC",
+            "SELECT f.id, f.ein, f.tax_year, f.object_id, f.xml_object_url, o.ruling_year "
+            "FROM filings f LEFT JOIN organizations o ON o.ein = f.ein "
+            "WHERE f.ein = ANY(%s) ORDER BY f.ein, f.tax_year DESC",
             (eins,),
         )
         return cur.fetchall()
 
 
 def extract_signals_for_survivors(
-    database_url: str, eins: Iterable[str], cache_dir: str | None = None
+    database_url: str,
+    eins: Iterable[str],
+    cache_dir: str | None = None,
+    force_recompute: bool = False,
 ) -> dict[str, Any]:
     """Stage 2 orchestrator (§4): resolves + parses each survivor's up-to-2 filings and
-    computes derived signals. Commits per filing/signal, not once at the end, so a run
-    interrupted partway through loses no completed work on restart.
+    computes derived signals.
+
+    Resumable at the EIN level: unless `force_recompute`, an EIN that already has a
+    signals row (see _select_eins_already_signaled) is skipped entirely — its filing
+    rows are never even selected — so a run killed partway through (replicaTimeout, a
+    job restart) picks up only the EINs it never finished, not from zero. Pass
+    `force_recompute=True` to reprocess every EIN regardless (e.g. after a parsing
+    bugfix that should overwrite previously-computed signals).
+
+    Streams per EIN rather than holding every parsed filing in memory for the whole
+    run: rows arrive ordered `ein, tax_year DESC` (_select_filing_rows), so a signal
+    is computed and queued for upsert as soon as an EIN's rows are exhausted, keeping
+    at most 2 parsed filings in memory at a time (compute_signals never needs more).
+    At 243k+ filings, the old whole-run `parsed_by_ein` dict would not have fit in a
+    2Gi container.
+
+    Caches one open zipfile.ZipFile handle per archive for the run's duration
+    (closed in the finally block below) instead of reopening + re-parsing each
+    archive's central directory on every filing — see fetch_filing_xml's docstring;
+    this was the dominant per-filing cost over the Azure Files SMB mount at national
+    scale (STATUS.md). build_year_index's own archive opens (once per archive, to
+    build the index) are unrelated and unchanged.
+
+    Writes (filings UPDATEs, the website backfill, signals upserts) are buffered and
+    sent together via _flush_stage2_batch, not committed one at a time — see
+    STAGE2_BATCH_COMMIT_EVERY_FILINGS. A signal is only ever queued into the same
+    batch as the filings rows it was computed from, so a signals row being visible at
+    all (the resume check above) guarantees its filings rows are already committed
+    too — never a resumed run that skips an EIN whose filings were actually never
+    written.
 
     Holds no single connection for the whole run: DB calls go through
     _ReconnectingConnection, which retries a dropped connection with backoff and
@@ -633,30 +719,98 @@ def extract_signals_for_survivors(
     long-lived connection isn't a safe assumption (see module comment above).
     """
     eins = list(eins)
-    counts: dict[str, Any] = {"filings_parsed": 0, "filings_failed": 0, "signals_computed": 0}
+    counts: dict[str, Any] = {
+        "filings_parsed": 0,
+        "filings_failed": 0,
+        "signals_computed": 0,
+        "eins_skipped_already_signaled": 0,
+    }
     year_indexes: dict[int, dict[str, tuple[str, str]]] = {}
+    archive_cache: dict[str, zipfile.ZipFile] = {}
     cache_dir = cache_dir or os.environ.get("ARCHIVE_CACHE_DIR", DEFAULT_ARCHIVE_CACHE_DIR)
+    timing_enabled = os.environ.get(STAGE2_TIMING_ENV_VAR, "").strip().lower() in ("1", "true", "yes")
+    timings = {"zip_read_s": 0.0, "parse_s": 0.0, "db_write_s": 0.0}
 
     db = _ReconnectingConnection(database_url)
     try:
         with httpx.Client(timeout=60.0) as client:
             db.run(lambda conn: sync_archive_manifest(client, conn, default_target_years(), cache_dir))
 
-            filing_rows = db.run(lambda conn: _select_filing_rows(conn, eins))
-            logger.info("Stage 2: %d filing rows to process for %d survivors", len(filing_rows), len(eins))
+            if force_recompute:
+                eins_to_process = eins
+            elif eins:
+                already_signaled = db.run(lambda conn: _select_eins_already_signaled(conn, eins))
+                eins_to_process = [ein for ein in eins if ein not in already_signaled]
+                counts["eins_skipped_already_signaled"] = len(eins) - len(eins_to_process)
+            else:
+                eins_to_process = []
 
-            parsed_by_ein: dict[str, list[dict[str, Any]]] = {}
+            filing_rows = db.run(lambda conn: _select_filing_rows(conn, eins_to_process)) if eins_to_process else []
+            logger.info(
+                "Stage 2: %d filing rows to process for %d survivors (%d already signaled, skipped)",
+                len(filing_rows),
+                len(eins_to_process),
+                counts["eins_skipped_already_signaled"],
+            )
+
+            filing_batch: list[dict[str, Any]] = []
+            website_batch: list[dict[str, Any]] = []
+            signal_batch: list[dict[str, Any]] = []
             website_backfilled: set[str] = set()
-            for filing_index, (filing_id, ein, tax_year, object_id, xml_object_url) in enumerate(filing_rows, start=1):
+
+            def flush_db_batch() -> None:
+                if not (filing_batch or website_batch or signal_batch):
+                    return
+                write_start = time.perf_counter() if timing_enabled else 0.0
+                db.run(lambda conn: _flush_stage2_batch(conn, filing_batch, website_batch, signal_batch))
+                if timing_enabled:
+                    timings["db_write_s"] += time.perf_counter() - write_start
+                filing_batch.clear()
+                website_batch.clear()
+                signal_batch.clear()
+
+            ein_state: dict[str, Any] = {"ein": None, "ruling_year": None, "buffered": []}
+
+            def flush_ein_signal() -> None:
+                buffered = ein_state["buffered"]
+                if ein_state["ein"] is not None and buffered:
+                    current, previous = buffered[0], buffered[1] if len(buffered) > 1 else None
+                    signal = compute_signals(current, previous, ein_state["ruling_year"], current["tax_year"])
+                    signal_batch.append(_signal_upsert_params(ein_state["ein"], current["tax_year"], signal))
+                    counts["signals_computed"] += 1
+                ein_state["buffered"] = []
+
+            for filing_index, (filing_id, ein, tax_year, object_id, xml_object_url, ruling_year) in enumerate(
+                filing_rows, start=1
+            ):
                 db.tick()
                 if filing_index % STAGE2_PROGRESS_LOG_EVERY_FILINGS == 0:
-                    logger.info(
-                        "Stage 2 progress: %d/%d filings processed (%d parsed, %d failed)",
-                        filing_index,
-                        len(filing_rows),
-                        counts["filings_parsed"],
-                        counts["filings_failed"],
-                    )
+                    if timing_enabled:
+                        logger.info(
+                            "Stage 2 progress: %d/%d filings processed (%d parsed, %d failed) "
+                            "timing_s[zip_read=%.1f parse=%.1f db_write=%.1f]",
+                            filing_index,
+                            len(filing_rows),
+                            counts["filings_parsed"],
+                            counts["filings_failed"],
+                            timings["zip_read_s"],
+                            timings["parse_s"],
+                            timings["db_write_s"],
+                        )
+                    else:
+                        logger.info(
+                            "Stage 2 progress: %d/%d filings processed (%d parsed, %d failed)",
+                            filing_index,
+                            len(filing_rows),
+                            counts["filings_parsed"],
+                            counts["filings_failed"],
+                        )
+
+                if ein != ein_state["ein"]:
+                    flush_ein_signal()
+                    ein_state["ein"] = ein
+                    ein_state["ruling_year"] = ruling_year
+
                 year = _year_from_archive_url(xml_object_url)
                 if year is None:
                     counts["filings_failed"] += 1
@@ -668,11 +822,17 @@ def extract_signals_for_survivors(
                     year_indexes[year] = db.run(lambda conn: build_year_index(conn, year))  # noqa: B023
 
                 try:
-                    xml_bytes = fetch_filing_xml(year_indexes[year], object_id)
+                    zip_start = time.perf_counter() if timing_enabled else 0.0
+                    xml_bytes = fetch_filing_xml(year_indexes[year], object_id, archive_cache)
+                    if timing_enabled:
+                        timings["zip_read_s"] += time.perf_counter() - zip_start
                     if xml_bytes is None:
                         counts["filings_failed"] += 1
                         continue
+                    parse_start = time.perf_counter() if timing_enabled else 0.0
                     parsed = parse_990_xml(xml_bytes)
+                    if timing_enabled:
+                        timings["parse_s"] += time.perf_counter() - parse_start
                 except Exception:
                     # Tolerated per §10 (990 XML variance is expected): unsupported zip
                     # compression methods, corrupt archive entries, transient network
@@ -684,26 +844,31 @@ def extract_signals_for_survivors(
                     counts["filings_failed"] += 1
                     continue
 
-                db.run(lambda conn: _update_filing(conn, filing_id, parsed))  # noqa: B023
+                filing_batch.append(_filing_update_params(filing_id, parsed))
                 counts["filings_parsed"] += 1
-                parsed_by_ein.setdefault(ein, []).append({**parsed, "tax_year": tax_year})
+                if len(ein_state["buffered"]) < 2:
+                    ein_state["buffered"].append({**parsed, "tax_year": tax_year})
 
-                # Rows arrive ordered ein, tax_year DESC — the first hit per ein is
-                # already the most recent filing, so only that one backfills the website.
+                # Rows arrive ordered ein, tax_year DESC — the first successfully-parsed
+                # hit per ein is already the most recent filing, so only that one
+                # backfills the website.
                 if ein not in website_backfilled:
                     website = parsed["website"]
-                    db.run(lambda conn: _update_organization_website(conn, ein, website))  # noqa: B023
+                    if website is not None:
+                        website_batch.append({"website": website, "ein": ein})
                     website_backfilled.add(ein)
 
-            for ein, filings in parsed_by_ein.items():
-                filings.sort(key=lambda f: f["tax_year"], reverse=True)
-                current, previous = filings[0], filings[1] if len(filings) > 1 else None
-                ruling_year = db.run(lambda conn: _get_ruling_year(conn, ein))  # noqa: B023
-                signal = compute_signals(current, previous, ruling_year, current["tax_year"])
-                tax_year = current["tax_year"]
-                db.run(lambda conn: _upsert_signal(conn, ein, tax_year, signal))  # noqa: B023
-                counts["signals_computed"] += 1
+                if len(filing_batch) >= STAGE2_BATCH_COMMIT_EVERY_FILINGS:
+                    flush_db_batch()
+
+            flush_ein_signal()
+            flush_db_batch()
     finally:
+        for local_path, archive in archive_cache.items():
+            try:
+                archive.close()
+            except Exception:
+                logger.debug("ignoring error closing cached zip handle for %s", local_path, exc_info=True)
         db.close()
 
     # §10 risk mitigation: "990 XML variance ... coverage % logged per run" — surfaces
@@ -716,6 +881,11 @@ def extract_signals_for_survivors(
     # Numerator is signals_computed, the actual survivor-level success signal — an
     # EIN whose first filing fails but whose second filing parses still gets a
     # computed signal, so this is stricter and more meaningful than filings_parsed.
+    #
+    # On a resumed run (force_recompute=False, some EINs skipped as already-signaled),
+    # signals_computed only counts EINs processed THIS call — coverage_pct reports
+    # this invocation's own success rate, not the cumulative total across a crashed
+    # run plus its resume. Query `signals` directly for cumulative coverage if needed.
     counts["coverage_pct"] = round(counts["signals_computed"] / len(eins), 4) if eins else None
 
     return counts

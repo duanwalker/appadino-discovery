@@ -15,6 +15,19 @@ def main(argv: list[str] | None = None) -> int:
         "filter", help="Run Stages 1-2 — recall filter + 990 signal extraction for a client"
     )
     filter_parser.add_argument("client_id", type=int)
+    filter_parser.add_argument(
+        "--limit-eins",
+        type=int,
+        default=None,
+        help="Bound Stage 2 to the first N post-suppression survivor EINs (~1-2 filings each) — "
+        "for measuring throughput on a sample without running the full survivor set",
+    )
+    filter_parser.add_argument(
+        "--force-refresh-signals",
+        action="store_true",
+        help="Reprocess every survivor EIN even if it already has a signals row, "
+        "instead of Stage 2's default resume behavior of skipping already-signaled EINs",
+    )
     score_parser = subparsers.add_parser("score", help="Run Stage 3 — Haiku + Sonnet scoring for a client")
     score_parser.add_argument("client_id", type=int)
     score_parser.add_argument(
@@ -38,7 +51,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "filter":
         from discovery.stages.run_filter_and_signals import run_filter_and_signals
 
-        counts = run_filter_and_signals(args.client_id)
+        counts = run_filter_and_signals(
+            args.client_id, limit_eins=args.limit_eins, force_refresh_signals=args.force_refresh_signals
+        )
         logger.info("filter complete: %s", counts)
         return 0
 

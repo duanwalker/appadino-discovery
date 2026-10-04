@@ -25,7 +25,9 @@ _FAKE_SIGNAL_COUNTS = {"filings_parsed": 0, "filings_failed": 0, "signals_comput
 
 
 def _make_capturing_extract_signals(captured_calls: list[list[str]]) -> Any:
-    def fake_extract_signals_for_survivors(_database_url: str, eins: list[str]) -> dict[str, Any]:
+    def fake_extract_signals_for_survivors(
+        _database_url: str, eins: list[str], force_recompute: bool = False
+    ) -> dict[str, Any]:
         captured_calls.append(list(eins))
         return _FAKE_SIGNAL_COUNTS
 

@@ -31,7 +31,20 @@ from discovery.stages.suppress import apply_suppression
 logger = logging.getLogger(__name__)
 
 
-def run_filter_and_signals(client_id: int, database_url: str | None = None) -> dict[str, Any]:
+def run_filter_and_signals(
+    client_id: int,
+    database_url: str | None = None,
+    limit_eins: int | None = None,
+    force_refresh_signals: bool = False,
+) -> dict[str, Any]:
+    """`limit_eins` truncates the post-suppression survivor set before Stage 2 — an
+    ops/testing knob for running a bounded sample (e.g. measuring Stage 2 throughput
+    on ~2,000-5,000 filings) without touching the full survivor count. Each EIN
+    contributes ~1-2 filing rows, so `limit_eins=N` is an approximation of "N*~1.5
+    filings," not an exact filing-count cap. `force_refresh_signals` passes through
+    to extract_signals_for_survivors' EIN-level resume skip (see its docstring) —
+    reprocesses every EIN instead of skipping ones that already have a signals row.
+    """
     database_url = database_url or os.environ["DATABASE_URL"]
 
     started_at = datetime.now(UTC)
@@ -67,7 +80,14 @@ def run_filter_and_signals(client_id: int, database_url: str | None = None) -> d
             counts["fuzzy_flagged_pre_extraction"],
         )
 
-        signal_counts = extract_signals_for_survivors(database_url, remaining_eins)
+        if limit_eins is not None:
+            remaining_eins = remaining_eins[:limit_eins]
+            counts["limited_to_eins"] = len(remaining_eins)
+            logger.info("Stage 2 input bounded to %d EINs (--limit-eins)", len(remaining_eins))
+
+        signal_counts = extract_signals_for_survivors(
+            database_url, remaining_eins, force_recompute=force_refresh_signals
+        )
         counts.update(signal_counts)
         logger.info("Stage 2: %s", signal_counts)
     except Exception as exc:
