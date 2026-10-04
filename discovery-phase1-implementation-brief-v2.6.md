@@ -1,4 +1,4 @@
-# Appadino Discovery — Phase 1 Implementation Brief (v2.3)
+# Appadino Discovery — Phase 1 Implementation Brief (v2.6)
 
 **Project:** Nonprofit prospect discovery pipeline (working name: **Discovery** / DiscoveryAI)
 **Repo:** `appadino-discovery` (private)
@@ -13,6 +13,10 @@
 **Changelog (v2.2 → v2.3):** Two clarifications from the real E1 spike run (see `pipeline/reports/e1_spike_20260919.md`): (1) disambiguated the "API over file export" client-integration decision from the dashboard's own CSV export button, since the shared "file export" language had caused real confusion between the two (§2); (2) redesigned the dashboard's contact display from a single flag-gated "Enrichment column" into five always-present columns, with Name/Title free and always visible and Email/Phone/Status locked until per-prospect enrichment — supersedes the prior design (§5).
 
 **Changelog (v2.3 → v2.4):** Two decisions from the E2 build session that v2.3's changelog never actually recorded, even though STATUS.md had already flagged both as carried into E2 from E1's close — this entry catches the brief up to what shipped (§5): (1) a fourth `email_status` bucket, `stale_likely_moved`, for a match FullEnrich reports as findable/verified but whose email domain doesn't belong to the org being prospected (E1's Day One finding — an officer resolving to a colleague's employer's domain); (2) the "real-vs-verified confidence signal" STATUS.md flagged as undesigned turned out not to need a separate mechanism — it's the same domain comparison that sets `stale_likely_moved`, with a personal-email-domain carve-out (gmail/yahoo/etc.) so an unpaid board volunteer's real, current personal address isn't misread as "moved." Also: the Name/Title-vs-enrichment-divergence open question v2.3 already posed in §5 is still open, but E2 now surfaces it visibly in the dashboard (a `contact_mismatch` flag) rather than silently picking an answer.
+
+**Changelog (v2.4 → v2.5):** Client API delivery (§2) elevated from a standing principle to a scheduled gate — G2.9, before G3.x. Originally written narrowly around ARCHITECT's Operations-app integration; ARCHITECT is no longer a customer, but the underlying capability is a real Discovery service offering for any future customer, so it stays in scope rather than getting dropped with them.
+
+**Changelog (v2.5 → v2.6):** G2.9 (Client API) architecture decided — Azure API Management Consumption tier fronting the existing Functions API, scoped read/enrich keys, per-tenant monthly_enrichment_cap enforced in application code independent of APIM's own rate limiting (defense in depth, not redundant — APIM gates access to the app, the cap gates whether the app allows the action).
 
 ---
 
@@ -60,9 +64,11 @@ A multi-tenant pipeline that ingests the national IRS nonprofit universe, applie
 - **PostgreSQL Flexible Server (B1ms)**: real SQL for the staged filters, JSONB for ICP configs and extracted signals, ~$15/mo. SQLite would be cheaper but kills the multi-tenant story and concurrent dashboard access.
 - **Static Web Apps**: Duan's proven pattern (portfolio site, AlphaBot). Free tier fine for Phase 1.
 - **Batch API for scoring**: runs are overnight anyway; 50% off makes national-scale scoring a non-event cost-wise.
-- **API over file export** (client-integration handoff, not the dashboard): when a client's own downstream system — e.g. ARCHITECT's Operations app — needs to receive DiscoveryAI data on an ongoing basis, the decision is API delivery, not periodic flat-file drops. This is a **separate decision from the dashboard's own one-click CSV export button** (§5) — that button is a standard feature available to every customer regardless of enrichment tier, and this decision doesn't change it. Both have been called "file export" in conversation, which has caused real confusion between the two; this line exists to keep them distinct.
+- **API over file export** (client-integration handoff, not the dashboard): when a client's own downstream system — e.g. ARCHITECT's Operations app — needs to receive DiscoveryAI data on an ongoing basis, the decision is API delivery, not periodic flat-file drops. This is a **separate decision from the dashboard's own one-click CSV export button** (§5) — that button is a standard feature available to every customer regardless of enrichment tier, and this decision doesn't change it. Both have been called "file export" in conversation, which has caused real confusion between the two; this line exists to keep them distinct. The capability is the product offering; it isn't scoped to any one client's integration need.
 
-**Estimated run cost:** Postgres ~$15/mo + Container Apps ~$2–5/mo + Claude API ~$10–40/full national run (see §6 token math) + SWA free + FullEnrich (one-time $500/12,500-credit pack, 6-month validity, chosen reseller starter tier — only if E-gates pass, only on approved prospects; see §5.5). Well under the $399/mo Discovery price point, even fully loaded.
+**G2.9 architecture decision:** this is now a scheduled deliverable, not just a standing principle. Azure API Management (Consumption tier — free up to 1M calls/month, ~$3.50/million after) sits in front of the Functions API, handling key issuance/rotation, rate limiting, and request analytics. APIM does NOT own any business logic — it's a gatekeeper, not a rule engine. Two scopes exist per client key: `read` (prospects data, matching CSV export) and `enrich` (triggers enrichment via the API). Critically: the monthly_enrichment_cap check happens in application code (the Functions API itself), not in APIM's policies — so even if a request successfully passes through APIM's gateway (correct key, under any rate limit), the app-level cap/scope check still runs and can still reject it. APIM controls whether a call reaches the app; it does not decide whether the call is allowed to succeed. This is a deliberate two-layer design, not redundant — APIM protects against volume/abuse at the network edge, the app-level check protects the shared FullEnrich credit pool regardless of how a request arrives (API, dashboard button, or any future entry point).
+
+**Estimated run cost:** Postgres ~$15/mo + Container Apps ~$2–5/mo + Claude API ~$10–40/full national run (see §6 token math) + SWA free + APIM Consumption tier (~free at current call volume, first 1M calls/month free, ~$3.50/million after) + FullEnrich (one-time $500/12,500-credit pack, 6-month validity, chosen reseller starter tier — only if E-gates pass, only on approved prospects; see §5.5). Well under the $399/mo Discovery price point, even fully loaded.
 
 ---
 
@@ -79,6 +85,9 @@ icp_configs        id, client_id, version, config JSONB, active bool, created_at
                    -- fullenrich_subaccount_id text NULL
                    -- (set when enrichment_enabled = true; passed as the
                    -- Sub-Account-Id header on FullEnrich v2 calls)
+                   -- monthly_enrichment_cap int (default 150)
+                   -- (checked by can_enrich() before any enrichment call
+                   -- succeeds — dashboard button and API alike, see §5.5)
 organizations      ein PK, name, state, city, ntee, ruling_year,
                    revenue_latest, foundation_code, bmf_updated_at
                    -- SHARED national universe (not tenant-scoped)
@@ -180,6 +189,8 @@ Parse latest 2 XML filings per survivor:
 
 **Sub-accounts.** One Appadino parent workspace, one API key. Each client gets a FullEnrich sub-account, passed as a `Sub-Account-Id` header on v2 API calls — `icp_configs.fullenrich_subaccount_id`, set alongside `enrichment_enabled` when a tenant is onboarded to enrichment. History, cache, and logs isolate per sub-account on FullEnrich's side; billing draws from one pooled Appadino credit balance, so consolidated billing and per-client compliance isolation both hold at once. Sub-account provisioning is manual for Phase 1 (client count is low); revisit API-driven provisioning in Phase 2 if client count grows.
 
+**Spend cap.** `icp_configs.config.monthly_enrichment_cap` (integer, default 150) bounds enrichment spend per tenant per month, checked by `can_enrich()` (or a wrapper around it) before any enrichment call succeeds — the dashboard's per-prospect "Enrich" button and the G2.9 API's `enrich`-scoped endpoint both go through this same check, so the cap can't be bypassed by using one entry point over the other. The 150 default is sized against FullEnrich's real per-credit cost ($500/12,500 credits = $0.04/credit; up to 11 credits for a full email+phone contact, ~$0.44) to stay well under a ~20%-of-$399/mo cost guideline even at worst-case per-contact cost.
+
 **Retention.** Delivered personal data carries a mandatory 90-day retention/refresh policy under the reseller terms. `enrichments.retention_expires_at` = `completed_at` + 90 days; the dashboard visually flags or grays out any contact past that window rather than treating it as permanently valid. Re-enrichment after expiry consumes a fresh credit.
 
 **Vertical scope — confirmed by FullEnrich.** Standard B2B professional-contact use (institutional donors, foundation directors, CSR leads, officials acting in a professional capacity) is fully supported. Consumer political profiling and voter data are explicitly excluded (GDPR Art. 9) — outside this system's scope regardless, but useful as written vendor confirmation for Lauren's sign-off.
@@ -246,12 +257,15 @@ Gates advance strictly in order within a track; Duan reviews and approves each b
 | **G1.4** Scoring | Haiku + Sonnet batch scoring, five-signal output, citations, DQ rules | 100-org pilot batch reviewed by Duan; zero demographic inferences; every claim cited |
 | **G1.5** Suppress + triggers + publish | Stages 4–6, CSV out, QA job, alerts | ARCHITECT seed suppression verified; end-to-end national run completes unattended |
 | **G2.x** Dashboard | table → statuses → suppression UI → export → run health | Lauren-usable without training; CSV matches POC format |
+| **G2.9** Client API | Azure API Management (Consumption tier) in front of the existing Functions API; scoped per-client keys (`read` vs `enrich` scopes, not one flat credential); read-only prospects endpoint matching CSV export's data; enrichment-scope calls additionally gated by a per-tenant monthly_enrichment_cap enforced in application code | A real customer can pull their own prospect list programmatically with a scoped credential; APIM handles key issuance, rate limiting, and throttling; a customer's enrich-scoped key cannot exceed its tenant's monthly cap regardless of call volume or rate |
 | **E1** FullEnrich spike | standalone script, no pipeline integration: enrich ~25 approved prospects, capture §5.5 metrics | Duan reviews metrics against adoption threshold; go/no-go recorded in `STATUS.md` |
 | **E2** Enrichment stage *(only if E1 = go)* | `enrichments` table live, per-prospect Enrich button, provider adapter behind an interface (FullEnrich first, swappable), flag-gated | enrichment never fires on non-approved prospects (tested); sub-account ID passed on every call; credits logged per call; `retention_expires_at` set and surfaced in dashboard; ARCHITECT tenant flag set per Lauren's decision |
 | **G3.x** Intake + dogfood | intake flow → config compiler → dogfood run | customer-2 prospect list exists; Duan approved dogfood config |
 | **G4** Hardening | fixes, docs, runbook | runbook lets a low-availability operator run everything in <2 hrs/mo |
 
 **Ordering notes:** E1 can run any time after G2.x produces approved prospects (it needs real approvals to enrich). It is deliberately parallel-safe — a standalone script — so it can be a "small session" task. E2 slots in whenever E1 passes; if E1 fails, delete both E-rows and nothing else moves.
+
+**G2.9 ordering note:** G2.9's `read` scope has no dependency on the E-gates and can be built/tested any time. The `enrich` scope and `monthly_enrichment_cap` enforcement depend on E2's concepts (`enrichment_enabled`, `fullenrich_subaccount_id`, `can_enrich()`) already existing — don't build or test the `enrich` scope until E2 is accepted, even if G2.9 is otherwise complete.
 
 **Wednesday Sept 16 scoping call checkpoint:** demo whatever exists at that point — no gate is pinned to it. Committed deliverable stays "scored national pipeline your team reviews." Reseller terms with FullEnrich are now confirmed, so if enrichment comes up, present it as "evaluating a verified-contact layer, commercial terms settled" — still not committed until E1 passes. Anything new from the call goes to the Phase 2 list unless it displaces something in this brief.
 
@@ -266,7 +280,7 @@ Gates advance strictly in order within a track; Duan reviews and approves each b
 5. No autonomous outreach paths — the outreach queue has no send capability in Phase 1 at all.
 6. NTEE never appears in scoring inputs (recall shaping only).
 7. Suppressed orgs never surface, and fuzzy suppression matches surface as flags, not silent drops.
-8. Enrichment never fires on a prospect whose status is not `approved`, never when the tenant's `enrichment_enabled` flag is false, and never when the tenant's `fullenrich_subaccount_id` is unset.
+8. Enrichment never fires on a prospect whose status is not `approved`, never when the tenant's `enrichment_enabled` flag is false, never when the tenant's `fullenrich_subaccount_id` is unset, and never when `can_enrich()` reports the tenant's `monthly_enrichment_cap` already met — checked identically regardless of entry point (dashboard button or G2.9 API).
 
 ## 10. Risks
 
@@ -283,7 +297,7 @@ Gates advance strictly in order within a track; Duan reviews and approves each b
 
 ## 11. Claude Code kickoff prompt
 
-> You are the implementer for `appadino-discovery`, working from `discovery-phase1-implementation-brief-v2.3.md` at repo root. Work gate by gate (§8), strictly in sequence, one scoped commit per gate item, conventional commit messages. Never start the next gate before I approve the current one. My sessions are irregular and may be days apart: end every gate with passing tests, a clean `main`, and an updated `STATUS.md` (done / next / open questions / decisions awaiting me) — assume the next session starts cold from that file. Python 3.12, type-hinted, pytest per module; infra as Bicep in `/infra`; config never hardcoded — everything tenant-variable lives in `icp_configs.config`. The hard rules in §9 are test cases first. The enrichment stage (§5.5, gates E1/E2) is candidate scope: write zero enrichment code unless I explicitly open gate E1. Start with G1.1: propose the repo layout and the Bicep plan, then wait for my review.
+> You are the implementer for `appadino-discovery`, working from `discovery-phase1-implementation-brief-v2.6.md` at repo root. Work gate by gate (§8), strictly in sequence, one scoped commit per gate item, conventional commit messages. Never start the next gate before I approve the current one. My sessions are irregular and may be days apart: end every gate with passing tests, a clean `main`, and an updated `STATUS.md` (done / next / open questions / decisions awaiting me) — assume the next session starts cold from that file. Python 3.12, type-hinted, pytest per module; infra as Bicep in `/infra`; config never hardcoded — everything tenant-variable lives in `icp_configs.config`. The hard rules in §9 are test cases first. The enrichment stage (§5.5, gates E1/E2) is candidate scope: write zero enrichment code unless I explicitly open gate E1. Start with G1.1: propose the repo layout and the Bicep plan, then wait for my review.
 
 ---
-*Owner: Duan Walker, Appadino AI LLC · Architect of record: Claude · v2.4, September 2026 (supersedes v2.3 — stale_likely_moved status and the real-vs-verified confidence signal, both already flagged in STATUS.md as carried into E2, actually written into the brief)*
+*Owner: Duan Walker, Appadino AI LLC · Architect of record: Claude · v2.6, September 2026 (supersedes v2.5 — G2.9 architecture decided: Azure API Management fronting the Functions API, scoped read/enrich keys, per-tenant monthly_enrichment_cap enforced in application code)*
