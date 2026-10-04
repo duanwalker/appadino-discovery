@@ -14,6 +14,7 @@ extract_signals_for_survivors() calls (resume / force-recompute).
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
@@ -88,9 +89,22 @@ class FakeCursor(AbstractContextManager["FakeCursor"]):
         if "FROM filings f LEFT JOIN organizations" in self._last_sql:
             requested = set(self._last_params[0])
             return [row for row in self.db.all_filing_rows if row[1] in requested]
-        if "SELECT DISTINCT ein FROM signals" in self._last_sql:
+        if "FROM (SELECT ein, MAX(tax_year)" in self._last_sql:
+            # Mirrors _select_eins_already_signaled's join: "done" = latest signal
+            # tax_year >= latest filing tax_year, for EINs that have both.
             requested = set(self._last_params[0])
-            return [(ein,) for ein in self.db.signals if ein in requested]
+            latest_filing_tax_year: dict[str, int] = {}
+            for row in self.db.all_filing_rows:
+                ein, tax_year = row[1], row[2]
+                if ein in requested:
+                    latest_filing_tax_year[ein] = max(latest_filing_tax_year.get(ein, tax_year), tax_year)
+            done = {
+                ein
+                for ein, (signal_tax_year, _signal) in self.db.signals.items()
+                if ein in requested and ein in latest_filing_tax_year
+                and signal_tax_year >= latest_filing_tax_year[ein]
+            }
+            return [(ein,) for ein in done]
         return []
 
     def fetchone(self) -> tuple[Any, ...] | None:
@@ -145,11 +159,14 @@ _URL_2024 = "https://apps.irs.gov/pub/epostcard/990/xml/2024/"
 
 
 def test_single_filing_ein_produces_a_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Also the "no signal yet -> process" resume case: no pre-existing signals row
+    for this EIN at all, so it must never be skipped."""
     db = FakeDB(filing_rows=[(1, "111111111", 2023, "f1", _URL_2024, 2010)])
     _wire_common_mocks(monkeypatch, db, {"f1": _parsed(revenue_total=500_000)})
 
     counts = extract_signals_for_survivors("postgres://example", ["111111111"])
 
+    assert counts["eins_skipped_already_signaled"] == 0
     assert counts["filings_parsed"] == 1
     assert counts["signals_computed"] == 1
     assert db.signals["111111111"][0] == 2023
@@ -213,13 +230,16 @@ def test_three_filings_one_ein_only_uses_first_two_for_the_signal(monkeypatch: p
     assert signal["revenue_trend"] == "growth"  # 150k vs 100k (f1/f2) — f3 (rev=1) never consulted
 
 
-def test_resume_skips_eins_with_existing_signals_row(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resume_skips_eins_whose_signal_is_current(monkeypatch: pytest.MonkeyPatch) -> None:
+    """"signal current -> skip": the existing signal's tax_year already matches the
+    EIN's latest filing — nothing has changed since it was computed, so it's skipped
+    outright, its filing row is never even fetched."""
     db = FakeDB(
         filing_rows=[
             (1, "111111111", 2023, "f1", _URL_2024, 2010),
             (2, "222222222", 2023, "f2", _URL_2024, 2012),
         ],
-        signals={"111111111": (2022, {"stale": True})},  # already has a signal from a prior run
+        signals={"111111111": (2023, {"existing": True})},  # matches the filing's own tax_year
     )
     _wire_common_mocks(monkeypatch, db, {"f1": _parsed(revenue_total=1), "f2": _parsed(revenue_total=2)})
 
@@ -228,27 +248,49 @@ def test_resume_skips_eins_with_existing_signals_row(monkeypatch: pytest.MonkeyP
     assert counts["eins_skipped_already_signaled"] == 1
     assert counts["filings_parsed"] == 1  # only 222222222's filing was even fetched
     assert 1 not in db.filings_updated  # 111111111's filing row was never touched
-    assert db.signals["111111111"] == (2022, {"stale": True})  # untouched — not recomputed
+    assert db.signals["111111111"] == (2023, {"existing": True})  # untouched — not recomputed
     assert db.signals["222222222"][0] == 2023
 
 
-def test_force_recompute_reprocesses_already_signaled_eins(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resume_reprocesses_ein_with_a_newer_filing_since_its_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """"newer filing arrived since signal -> reprocess": the signal is older than the
+    EIN's latest filing (e.g. a new tax year's 990 showed up after the signal was
+    computed) — must NOT be skipped, even though a signals row exists."""
     db = FakeDB(
         filing_rows=[(1, "111111111", 2023, "f1", _URL_2024, 2010)],
-        signals={"111111111": (2022, {"stale": True})},
+        signals={"111111111": (2022, {"stale": True})},  # computed from last year's filing
     )
     _wire_common_mocks(monkeypatch, db, {"f1": _parsed(revenue_total=750_000)})
 
-    counts = extract_signals_for_survivors(
-        "postgres://example", ["111111111"], force_recompute=True
-    )
+    counts = extract_signals_for_survivors("postgres://example", ["111111111"])
 
     assert counts["eins_skipped_already_signaled"] == 0
     assert counts["filings_parsed"] == 1
     assert 1 in db.filings_updated
     tax_year, signal = db.signals["111111111"]
-    assert tax_year == 2023  # recomputed from the real filing, not left as the stale stub
+    assert tax_year == 2023  # recomputed off the new filing, not left as the stale 2022 stub
     assert signal != {"stale": True}
+
+
+def test_force_recompute_reprocesses_eins_even_with_a_current_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """"force flag still bypasses": even a genuinely up-to-date signal (tax_year
+    already matches the latest filing — would be skipped otherwise, see
+    test_resume_skips_eins_whose_signal_is_current) gets recomputed under
+    force_recompute=True."""
+    db = FakeDB(
+        filing_rows=[(1, "111111111", 2023, "f1", _URL_2024, 2010)],
+        signals={"111111111": (2023, {"stale": True})},  # already current by the tax_year check
+    )
+    _wire_common_mocks(monkeypatch, db, {"f1": _parsed(revenue_total=750_000)})
+
+    counts = extract_signals_for_survivors("postgres://example", ["111111111"], force_recompute=True)
+
+    assert counts["eins_skipped_already_signaled"] == 0
+    assert counts["filings_parsed"] == 1
+    assert 1 in db.filings_updated
+    tax_year, signal = db.signals["111111111"]
+    assert tax_year == 2023
+    assert signal != {"stale": True}  # recomputed from the real filing, not left as the stub
 
 
 class _RecordingZipFile:
@@ -274,6 +316,10 @@ class _RecordingZipFile:
 
 
 def test_fetch_filing_xml_reuses_cached_handle_across_filings_same_archive(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The on-disk existence check (item 2 below) is covered by its own dedicated
+    # tests — not relevant to what this test is checking (handle reuse), so disabled
+    # here rather than requiring a real file on disk for a fake "archive.zip" path.
+    monkeypatch.setattr(extract_signals, "_require_archive_on_disk", lambda *_a, **_k: None)
     _RecordingZipFile.instances = []
     monkeypatch.setattr(extract_signals.zipfile, "ZipFile", _RecordingZipFile)
     year_index = {"obj-a": ("archive.zip", "a.xml"), "obj-b": ("archive.zip", "b.xml")}
@@ -294,6 +340,7 @@ def test_handle_cache_closes_all_open_zip_handles_on_error(monkeypatch: pytest.M
     failures) must still leave every already-opened zip handle closed, not leaked —
     the whole point of caching handles for the run's duration instead of using a
     `with` block per filing."""
+    monkeypatch.setattr(extract_signals, "_require_archive_on_disk", lambda *_a, **_k: None)
     _RecordingZipFile.instances = []
     monkeypatch.setattr(extract_signals.zipfile, "ZipFile", _RecordingZipFile)
 
@@ -330,3 +377,70 @@ def test_handle_cache_closes_all_open_zip_handles_on_error(monkeypatch: pytest.M
 
     assert len(_RecordingZipFile.instances) == 2  # both archives were opened before the crash
     assert all(instance.closed for instance in _RecordingZipFile.instances)
+
+
+class _MinimalManifestCursor(AbstractContextManager["_MinimalManifestCursor"]):
+    """Deliberately only accepts the one SELECT build_year_index is expected to run
+    — anything else (an INSERT/UPDATE/DELETE against archive_manifest, in particular)
+    raises, which is how test_build_year_index_... below proves a missing file does
+    NOT trigger an auto-delete of the manifest row or a re-download."""
+
+    def __init__(self, rows: list[tuple[int, str, str]]) -> None:
+        self._rows = rows
+        self._result: list[tuple[Any, ...]] = []
+
+    def execute(self, sql: str, params: Any = None) -> None:
+        if "SELECT month, suffix, local_path FROM archive_manifest" not in sql:
+            raise AssertionError(f"unexpected SQL — build_year_index should only ever SELECT: {sql!r}")
+        self._result = self._rows
+
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        return self._result
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+class _MinimalManifestConn(AbstractContextManager["_MinimalManifestConn"]):
+    def __init__(self, rows: list[tuple[int, str, str]]) -> None:
+        self.rows = rows
+
+    def cursor(self) -> _MinimalManifestCursor:
+        return _MinimalManifestCursor(self.rows)
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def test_build_year_index_fails_fast_naming_year_month_suffix_path_when_file_missing(tmp_path: Path) -> None:
+    missing_path = str(tmp_path / "2024_TEOS_XML_03B.zip")  # tmp_path exists; this specific file doesn't
+    conn = _MinimalManifestConn(rows=[(3, "B", missing_path)])
+
+    with pytest.raises(extract_signals.ArchiveFileMissingError) as exc_info:
+        extract_signals.build_year_index(conn, 2024)  # type: ignore[arg-type]
+
+    message = str(exc_info.value)
+    assert "year=2024" in message
+    assert "month=3" in message
+    assert "suffix='B'" in message
+    assert repr(missing_path) in message
+
+
+def test_fetch_filing_xml_fails_fast_naming_object_id_and_path_when_file_missing() -> None:
+    missing_path = "C:/nonexistent/2024_TEOS_XML_01A.zip"
+    year_index = {"obj-missing": (missing_path, "member.xml")}
+
+    with pytest.raises(extract_signals.ArchiveFileMissingError) as exc_info:
+        extract_signals.fetch_filing_xml(year_index, "obj-missing", {})
+
+    message = str(exc_info.value)
+    assert "object_id=obj-missing" in message
+    assert repr(missing_path) in message
+
+
+def test_fetch_filing_xml_fails_fast_without_an_archive_cache_too() -> None:
+    missing_path = "C:/nonexistent/2024_TEOS_XML_01A.zip"
+    year_index = {"obj-missing": (missing_path, "member.xml")}
+
+    with pytest.raises(extract_signals.ArchiveFileMissingError):
+        extract_signals.fetch_filing_xml(year_index, "obj-missing")

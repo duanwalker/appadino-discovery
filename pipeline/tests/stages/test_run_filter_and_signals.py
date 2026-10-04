@@ -125,6 +125,7 @@ def test_ein_exact_match_never_reaches_extract_signals_input(monkeypatch: pytest
     assert counts["survivors"] == 3
     assert counts["ein_suppressed_pre_extraction"] == 1
     assert counts["fuzzy_flagged_pre_extraction"] == 1
+    assert counts["eins_overridden"] is False
 
 
 def test_no_suppression_matches_passes_full_survivor_set_through(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -147,3 +148,60 @@ def test_no_suppression_matches_passes_full_survivor_set_through(monkeypatch: py
     assert captured_extract_calls == [["444444444"]]
     assert counts["ein_suppressed_pre_extraction"] == 0
     assert counts["fuzzy_flagged_pre_extraction"] == 0
+    assert counts["eins_overridden"] is False
+
+
+def test_override_eins_bypasses_stage1_and_suppression_entirely(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_conn = FakeConn(suppression_entries=[], org_names={})
+    captured_extract_calls: list[list[str]] = []
+
+    def _select_survivor_eins_must_not_be_called(_conn: Any, _client_id: int) -> list[str]:
+        raise AssertionError("select_survivor_eins must not be called when override_eins is given")
+
+    monkeypatch.setattr(
+        "discovery.stages.run_filter_and_signals.psycopg.connect", lambda _database_url: fake_conn
+    )
+    monkeypatch.setattr(
+        run_filter_and_signals, "select_survivor_eins", _select_survivor_eins_must_not_be_called
+    )
+    monkeypatch.setattr(
+        run_filter_and_signals,
+        "extract_signals_for_survivors",
+        _make_capturing_extract_signals(captured_extract_calls),
+    )
+
+    counts = run_filter_and_signals.run_filter_and_signals(
+        client_id=1, database_url="postgres://example", override_eins=["999999999", "888888888"]
+    )
+
+    assert captured_extract_calls == [["999999999", "888888888"]]
+    assert counts["eins_overridden"] is True
+    assert counts["survivors"] == 2
+    assert counts["ein_suppressed_pre_extraction"] == 0
+    assert counts["fuzzy_flagged_pre_extraction"] == 0
+
+
+def test_override_eins_combined_with_limit_eins_truncates_the_override_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_conn = FakeConn(suppression_entries=[], org_names={})
+    captured_extract_calls: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "discovery.stages.run_filter_and_signals.psycopg.connect", lambda _database_url: fake_conn
+    )
+    monkeypatch.setattr(
+        run_filter_and_signals,
+        "extract_signals_for_survivors",
+        _make_capturing_extract_signals(captured_extract_calls),
+    )
+
+    counts = run_filter_and_signals.run_filter_and_signals(
+        client_id=1,
+        database_url="postgres://example",
+        override_eins=["111111111", "222222222", "333333333"],
+        limit_eins=2,
+    )
+
+    assert captured_extract_calls == [["111111111", "222222222"]]
+    assert counts["limited_to_eins"] == 2

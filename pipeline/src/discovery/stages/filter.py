@@ -73,7 +73,11 @@ def build_survivor_query(recall: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     if recall["require_filing_on_record"]:
         conditions.append("EXISTS (SELECT 1 FROM filings f WHERE f.ein = o.ein)")
 
-    query = "SELECT o.ein FROM organizations o WHERE " + " AND ".join(conditions)
+    # ORDER BY so the survivor list is reproducible across runs — without it, a
+    # bounded sample (--limit-eins) would silently pick a different, arbitrary subset
+    # of the same survivor set each run, since Postgres makes no ordering guarantee
+    # absent an explicit ORDER BY.
+    query = "SELECT o.ein FROM organizations o WHERE " + " AND ".join(conditions) + " ORDER BY o.ein"
     return query, params
 
 

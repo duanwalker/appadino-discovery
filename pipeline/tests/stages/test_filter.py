@@ -47,6 +47,15 @@ def test_build_survivor_query_require_filing_false_omits_exists_clause() -> None
     assert "EXISTS" not in query
 
 
+def test_build_survivor_query_orders_by_ein_for_reproducible_bounded_samples() -> None:
+    """Without an explicit ORDER BY, Postgres makes no guarantee about row order —
+    a bounded sample (CLI --limit-eins, truncating the survivor list) would silently
+    pick a different arbitrary subset each run. ORDER BY o.ein makes "the first N
+    survivors" mean the same N EINs every time."""
+    query, _ = build_survivor_query({})
+    assert query.rstrip().endswith("ORDER BY o.ein")
+
+
 def test_excludes_are_read_per_tenant_from_icp_configs_not_hardcoded() -> None:
     """Two icp_configs rows differing only in whether "private_foundation" (BMF
     foundation_code 03) is in recall_filter.exclude_foundation_codes must produce

@@ -123,6 +123,27 @@ class _ReconnectingConnection:
             logger.debug("ignoring error while closing Stage 2 connection", exc_info=True)
 
 
+class ArchiveFileMissingError(RuntimeError):
+    """archive_manifest says a shard was downloaded, but its local_path isn't on disk
+    — a cache/manifest integrity problem (STATUS.md "Also found, fixed, not yet
+    hardened" — this is that fix), not a per-filing data issue §10's tolerance covers.
+    Deliberately never auto-deletes the manifest row or re-downloads over it: either
+    would paper over whatever actually desynced the cache from the manifest (e.g. one
+    run's local scratch paths leaking into the shared table, as happened once
+    already) instead of surfacing it. Raised with the year/month/suffix/path so it's
+    immediately actionable from a Container Apps Job log line.
+    """
+
+
+def _require_archive_on_disk(local_path: str, context: str) -> None:
+    if not Path(local_path).exists():
+        raise ArchiveFileMissingError(
+            f"archive_manifest local_path not found on disk ({context}): {local_path!r} — "
+            "not auto-deleting the manifest row or re-downloading; investigate why the local "
+            "cache is missing a file the manifest says exists before retrying."
+        )
+
+
 ARCHIVE_URL_TEMPLATE = "https://apps.irs.gov/pub/epostcard/990/xml/{year}/{filename}"
 MONTHS = range(1, 13)
 SUFFIXES = ("A", "B", "C", "D")
@@ -537,13 +558,19 @@ def build_year_index(conn: psycopg.Connection, year: int) -> dict[str, tuple[str
     calls) — sync_archive_manifest() must have already downloaded every shard for
     this year and recorded it in archive_manifest before this runs. Built once per
     year, shared across all survivors.
+
+    Fails fast (ArchiveFileMissingError) naming the exact year/month/suffix/path if a
+    manifest row's local_path isn't actually on disk — this runs outside any
+    per-filing try/except in extract_signals_for_survivors, so the error propagates
+    and stops the run rather than being silently tolerated as a per-filing failure.
     """
     with conn.cursor() as cur:
-        cur.execute("SELECT local_path FROM archive_manifest WHERE year = %s", (year,))
-        local_paths = [row[0] for row in cur.fetchall()]
+        cur.execute("SELECT month, suffix, local_path FROM archive_manifest WHERE year = %s", (year,))
+        rows = cur.fetchall()
 
     index: dict[str, tuple[str, str]] = {}
-    for local_path in local_paths:
+    for month, suffix, local_path in rows:
+        _require_archive_on_disk(local_path, f"year={year} month={month} suffix={suffix!r}")
         with zipfile.ZipFile(local_path) as archive:
             for member in archive.namelist():
                 if not member.endswith("_public.xml"):
@@ -572,11 +599,13 @@ def fetch_filing_xml(
         return None
     local_path, member = entry
     if archive_cache is None:
+        _require_archive_on_disk(local_path, f"object_id={object_id}")
         with zipfile.ZipFile(local_path) as transient_archive:
             data: bytes = transient_archive.read(member)
             return data
     cached_archive = archive_cache.get(local_path)
     if cached_archive is None:
+        _require_archive_on_disk(local_path, f"object_id={object_id}")
         cached_archive = zipfile.ZipFile(local_path)
         archive_cache[local_path] = cached_archive
     return cached_archive.read(member)
@@ -649,12 +678,35 @@ def _flush_stage2_batch(
 
 
 def _select_eins_already_signaled(conn: psycopg.Connection, eins: list[str]) -> set[str]:
-    """EINs (from `eins`) that already have a signals row, for any tax_year — signals
-    has no client_id, so this is true regardless of which client/run computed it.
+    """EINs (from `eins`) that are genuinely caught up: their most recent signals row
+    (any tax_year — signals has no client_id, so this is true regardless of which
+    client/run computed it) is at least as new as their most recent filings row. An
+    EIN that has a signal but then gets a newer filing (latest filings.tax_year >
+    latest signals.tax_year) is NOT considered done — it's reprocessed on the next
+    run, since the old signal no longer reflects the org's latest filing.
+
+    An EIN whose latest filing permanently fails to resolve/parse never gets a
+    signals row at that filing's tax_year, so it never satisfies the >= comparison
+    either — it's retried every run rather than silently given up on. Accepted cost
+    (see extract_signals_for_survivors docstring): national-scale retries on a small,
+    stable set of permanently-broken filings are cheap relative to the alternative of
+    quietly never catching a transient failure that later becomes fixable (e.g. the
+    archive gets re-synced).
+
     Used to skip already-processed EINs on resume (extract_signals_for_survivors);
-    `force_recompute=True` bypasses this entirely."""
+    `force_recompute=True` bypasses this entirely.
+    """
     with conn.cursor() as cur:
-        cur.execute("SELECT DISTINCT ein FROM signals WHERE ein = ANY(%s)", (eins,))
+        cur.execute(
+            """
+            SELECT f.ein
+            FROM (SELECT ein, MAX(tax_year) AS latest_tax_year FROM filings WHERE ein = ANY(%s) GROUP BY ein) f
+            JOIN (SELECT ein, MAX(tax_year) AS latest_tax_year FROM signals WHERE ein = ANY(%s) GROUP BY ein) s
+                ON s.ein = f.ein
+            WHERE s.latest_tax_year >= f.latest_tax_year
+            """,
+            (eins, eins),
+        )
         return {row[0] for row in cur.fetchall()}
 
 
@@ -683,12 +735,19 @@ def extract_signals_for_survivors(
     """Stage 2 orchestrator (§4): resolves + parses each survivor's up-to-2 filings and
     computes derived signals.
 
-    Resumable at the EIN level: unless `force_recompute`, an EIN that already has a
-    signals row (see _select_eins_already_signaled) is skipped entirely — its filing
-    rows are never even selected — so a run killed partway through (replicaTimeout, a
-    job restart) picks up only the EINs it never finished, not from zero. Pass
-    `force_recompute=True` to reprocess every EIN regardless (e.g. after a parsing
-    bugfix that should overwrite previously-computed signals).
+    Resumable at the EIN level: unless `force_recompute`, an EIN whose latest signal
+    is already at least as new as its latest filing (see _select_eins_already_signaled)
+    is skipped entirely — its filing rows are never even selected — so a run killed
+    partway through (replicaTimeout, a job restart) picks up only the EINs it never
+    finished, not from zero. An EIN that gets a newer filing after its signal was
+    computed is NOT skipped; it's reprocessed. Pass `force_recompute=True` to
+    reprocess every EIN regardless (e.g. after a parsing bugfix that should overwrite
+    previously-computed signals).
+
+    A manifest row whose local_path isn't actually on disk (ArchiveFileMissingError)
+    is NOT tolerated like a per-filing parse failure — it propagates and stops the
+    run, since it signals a cache/manifest integrity problem rather than ordinary
+    990-XML schema variance (see build_year_index / fetch_filing_xml).
 
     Streams per EIN rather than holding every parsed filing in memory for the whole
     run: rows arrive ordered `ein, tax_year DESC` (_select_filing_rows), so a signal
@@ -833,6 +892,12 @@ def extract_signals_for_survivors(
                     parsed = parse_990_xml(xml_bytes)
                     if timing_enabled:
                         timings["parse_s"] += time.perf_counter() - parse_start
+                except ArchiveFileMissingError:
+                    # NOT tolerated like the per-filing failures below: a manifest row
+                    # pointing at a file that isn't on disk is a cache/manifest
+                    # integrity problem, not §10 data variance — let it propagate and
+                    # stop the run (see ArchiveFileMissingError/build_year_index).
+                    raise
                 except Exception:
                     # Tolerated per §10 (990 XML variance is expected): unsupported zip
                     # compression methods, corrupt archive entries, transient network

@@ -28,6 +28,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Reprocess every survivor EIN even if it already has a signals row, "
         "instead of Stage 2's default resume behavior of skipping already-signaled EINs",
     )
+    filter_parser.add_argument(
+        "--eins",
+        default=None,
+        help="Comma-separated EIN list that REPLACES Stage 1 + suppression entirely for this run "
+        "(e.g. to run Stage 2 on an exact pilot org list) — logged as an override and recorded "
+        "in runs.counts.eins_overridden, not combined with the client's normal survivor set",
+    )
     score_parser = subparsers.add_parser("score", help="Run Stage 3 — Haiku + Sonnet scoring for a client")
     score_parser.add_argument("client_id", type=int)
     score_parser.add_argument(
@@ -51,8 +58,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "filter":
         from discovery.stages.run_filter_and_signals import run_filter_and_signals
 
+        override_eins = (
+            [ein.strip() for ein in args.eins.split(",") if ein.strip()] if args.eins is not None else None
+        )
         counts = run_filter_and_signals(
-            args.client_id, limit_eins=args.limit_eins, force_refresh_signals=args.force_refresh_signals
+            args.client_id,
+            limit_eins=args.limit_eins,
+            force_refresh_signals=args.force_refresh_signals,
+            override_eins=override_eins,
         )
         logger.info("filter complete: %s", counts)
         return 0

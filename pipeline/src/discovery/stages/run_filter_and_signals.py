@@ -36,14 +36,27 @@ def run_filter_and_signals(
     database_url: str | None = None,
     limit_eins: int | None = None,
     force_refresh_signals: bool = False,
+    override_eins: list[str] | None = None,
 ) -> dict[str, Any]:
-    """`limit_eins` truncates the post-suppression survivor set before Stage 2 — an
-    ops/testing knob for running a bounded sample (e.g. measuring Stage 2 throughput
-    on ~2,000-5,000 filings) without touching the full survivor count. Each EIN
-    contributes ~1-2 filing rows, so `limit_eins=N` is an approximation of "N*~1.5
-    filings," not an exact filing-count cap. `force_refresh_signals` passes through
-    to extract_signals_for_survivors' EIN-level resume skip (see its docstring) —
+    """`limit_eins` truncates the post-suppression (or post-override) survivor set
+    before Stage 2 — an ops/testing knob for running a bounded sample (e.g. measuring
+    Stage 2 throughput on ~2,000-5,000 filings) without touching the full survivor
+    count. Each EIN contributes ~1-2 filing rows, so `limit_eins=N` is an
+    approximation of "N*~1.5 filings," not an exact filing-count cap. Reproducible
+    across runs: Stage 1's own query is `ORDER BY o.ein` (filter.py), and
+    apply_suppression() preserves input order, so truncating to the first N always
+    picks the same N EINs. `force_refresh_signals` passes through to
+    extract_signals_for_survivors' EIN-level resume skip (see its docstring) —
     reprocesses every EIN instead of skipping ones that already have a signals row.
+
+    `override_eins`, if given, REPLACES Stage 1 + suppression entirely for this run
+    — `select_survivor_eins`/`apply_suppression` are never called, and Stage 2 runs
+    on exactly the given EINs (e.g. "run Stage 2 on exactly these 154 pilot orgs,"
+    independent of whatever Stage 1's recall filter currently selects for the
+    client). Logged clearly and recorded in the returned/persisted `runs.counts`
+    (`eins_overridden: true`) since it's a deliberate bypass of the client's normal
+    survivor set, not something that should look like an ordinary run in the `runs`
+    table.
     """
     database_url = database_url or os.environ["DATABASE_URL"]
 
@@ -66,19 +79,33 @@ def run_filter_and_signals(
         conn.commit()
 
     try:
-        with psycopg.connect(database_url) as conn:
-            survivor_eins = select_survivor_eins(conn, client_id)
-            counts["survivors"] = len(survivor_eins)
-            logger.info("Stage 1: %d survivors for client_id=%s", len(survivor_eins), client_id)
+        if override_eins is not None:
+            remaining_eins = list(override_eins)
+            counts["survivors"] = len(remaining_eins)
+            counts["eins_overridden"] = True
+            counts["ein_suppressed_pre_extraction"] = 0
+            counts["fuzzy_flagged_pre_extraction"] = 0
+            logger.warning(
+                "OVERRIDE (--eins): Stage 1 + suppression bypassed for client_id=%s — running Stage 2 "
+                "on %d explicitly-provided EINs instead of the client's survivor set",
+                client_id,
+                len(remaining_eins),
+            )
+        else:
+            with psycopg.connect(database_url) as conn:
+                survivor_eins = select_survivor_eins(conn, client_id)
+                counts["survivors"] = len(survivor_eins)
+                counts["eins_overridden"] = False
+                logger.info("Stage 1: %d survivors for client_id=%s", len(survivor_eins), client_id)
 
-            remaining_eins, fuzzy_flags = apply_suppression(conn, client_id, survivor_eins)
-        counts["ein_suppressed_pre_extraction"] = len(survivor_eins) - len(remaining_eins)
-        counts["fuzzy_flagged_pre_extraction"] = len(fuzzy_flags)
-        logger.info(
-            "Suppression (pre-Stage2): %d EIN-exact suppressed, %d fuzzy-flagged (continuing to Stage 2/3)",
-            counts["ein_suppressed_pre_extraction"],
-            counts["fuzzy_flagged_pre_extraction"],
-        )
+                remaining_eins, fuzzy_flags = apply_suppression(conn, client_id, survivor_eins)
+            counts["ein_suppressed_pre_extraction"] = len(survivor_eins) - len(remaining_eins)
+            counts["fuzzy_flagged_pre_extraction"] = len(fuzzy_flags)
+            logger.info(
+                "Suppression (pre-Stage2): %d EIN-exact suppressed, %d fuzzy-flagged (continuing to Stage 2/3)",
+                counts["ein_suppressed_pre_extraction"],
+                counts["fuzzy_flagged_pre_extraction"],
+            )
 
         if limit_eins is not None:
             remaining_eins = remaining_eins[:limit_eins]

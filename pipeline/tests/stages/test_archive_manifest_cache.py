@@ -97,6 +97,11 @@ class FakeManifestCursor:
             self._result = [
                 (row["local_path"],) for (y, _m, _s), row in self.conn.rows.items() if y == year
             ]
+        elif stripped.startswith("SELECT month, suffix, local_path FROM archive_manifest"):
+            year = params[0]
+            self._result = [
+                (m, s, row["local_path"]) for (y, m, s), row in self.conn.rows.items() if y == year
+            ]
         elif stripped.startswith("SELECT month, suffix, url, local_path, size_bytes"):
             year = params[0]
             self._result = [
