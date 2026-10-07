@@ -1,0 +1,326 @@
+# Appadino Discovery — Phase 1 Implementation Brief (v2.7)
+
+**Project:** Nonprofit prospect discovery pipeline (working name: **Discovery** / DiscoveryAI)
+**Repo:** `appadino-discovery` (private)
+**Roles:** Claude = lead architect (this brief) · Claude Code = implementer · Copilot = test developer · Duan = reviewer at every gate
+**Cadence:** Sequence-gated, not calendar-gated. Work happens in irregular sessions; gates advance when reviewed and approved, never on a date.
+**Design partner:** ARCHITECT Philanthropic Collective (Track B — consulting-client discovery). First revenue already collected ($500 POC/discovery, paid).
+
+**Changelog (v2.0 → v2.1):** FullEnrich reseller terms confirmed by Hugo (FullEnrich) — Reseller Agreement is the access path (not self-serve Pro); per-tenant `fullenrich_subaccount_id` added for the `Sub-Account-Id` API header; 90-day retention field added to `enrichments`; nonprofit/advocacy vertical confirmed in scope, consumer political/voter data confirmed out of scope. Scoping call rescheduled from Sept 10 to **Wednesday, Sept 16, 2026**.
+
+**Changelog (v2.1 → v2.2):** Switched the FullEnrich starter tier from the $250/mo annual-commit plan (10,000 credits/month, ~$3,000/year obligation) to the **$500 one-time 12,500-credit pack** (6-month validity, no recurring commitment) — sized to current single-client volume, and avoids locking in a 12-month spend before gate E1 has validated real match rates and cost-per-contact.
+
+**Changelog (v2.2 → v2.3):** Two clarifications from the real E1 spike run (see `pipeline/reports/e1_spike_20260919.md`): (1) disambiguated the "API over file export" client-integration decision from the dashboard's own CSV export button, since the shared "file export" language had caused real confusion between the two (§2); (2) redesigned the dashboard's contact display from a single flag-gated "Enrichment column" into five always-present columns, with Name/Title free and always visible and Email/Phone/Status locked until per-prospect enrichment — supersedes the prior design (§5).
+
+**Changelog (v2.3 → v2.4):** Two decisions from the E2 build session that v2.3's changelog never actually recorded, even though STATUS.md had already flagged both as carried into E2 from E1's close — this entry catches the brief up to what shipped (§5): (1) a fourth `email_status` bucket, `stale_likely_moved`, for a match FullEnrich reports as findable/verified but whose email domain doesn't belong to the org being prospected (E1's Day One finding — an officer resolving to a colleague's employer's domain); (2) the "real-vs-verified confidence signal" STATUS.md flagged as undesigned turned out not to need a separate mechanism — it's the same domain comparison that sets `stale_likely_moved`, with a personal-email-domain carve-out (gmail/yahoo/etc.) so an unpaid board volunteer's real, current personal address isn't misread as "moved." Also: the Name/Title-vs-enrichment-divergence open question v2.3 already posed in §5 is still open, but E2 now surfaces it visibly in the dashboard (a `contact_mismatch` flag) rather than silently picking an answer.
+
+**Changelog (v2.4 → v2.5):** Client API delivery (§2) elevated from a standing principle to a scheduled gate — G2.9, before G3.x. Originally written narrowly around ARCHITECT's Operations-app integration; ARCHITECT is no longer a customer, but the underlying capability is a real Discovery service offering for any future customer, so it stays in scope rather than getting dropped with them.
+
+**Changelog (v2.5 → v2.6):** G2.9 (Client API) architecture decided — Azure API Management Consumption tier fronting the existing Functions API, scoped read/enrich keys, per-tenant monthly_enrichment_cap enforced in application code independent of APIM's own rate limiting (defense in depth, not redundant — APIM gates access to the app, the cap gates whether the app allows the action).
+
+**Changelog (v2.6 → v2.7):** Duan decided to launch a managed-service v1 for the first customer rather than continue building toward the rest of this brief — added a new **"v1 launch scope (frozen)"** section (below, right after this changelog) listing exactly what ships before launch and what's explicitly deferred. `G2.9` and `G3.x` are marked **deferred past v1** in the gate table (§8) — not removed from the brief, just sequenced after launch. Nothing else in the brief is renumbered or otherwise changed by this entry.
+
+---
+
+## v1 launch scope (frozen)
+
+**Decision (Duan):** launch a managed-service v1 for the first customer. Everything else is deferred.
+
+**V1 done list** (in this order):
+
+1. Stage 2 closed: real-Postgres integration tests pass (local scratch Postgres or CI); live regression diff on the 154 pilot orgs is empty; sampled throughput run recorded with STAGE2_TIMING breakdown and peak memory; a national Stage 2 run projects to finish unattended and resumably.
+2. G1.5's open criterion met: an end-to-end national run (Stage 1 → 2 → 3 scoring → publish) completes unattended in the Container Apps Job, with run counts recorded.
+3. Scoring spot-check: Duan manually reviews the top ~25 plus ~25 random prospects for ICP fit; findings written up; only blocking scoring defects are fixed before launch.
+4. Dashboard + CSV export verified end to end on the internal-QA tenant, including the columns Lauren originally asked for.
+5. Minimal access control for ONE customer: an unauthenticated caller cannot read any prospects, and `client_id` is derived from the authenticated principal, never caller-controlled. First deliver a short proposal with 2-3 mechanism options (for example Static Web Apps / App Service built-in auth with an allowlist) and tradeoffs; implement only after Duan approves.
+6. CI workflow with a Postgres service container that runs the full suite including the integration tests.
+7. Housekeeping: repo made private, Postgres `AllowDevMachine` firewall rule removed or documented as intentional, minimal runbook (run a national refresh, onboard a customer by inserting an `icp_configs` row, export, rotate the Anthropic key, restore the DB) sized to the under-2-hours-a-month goal.
+8. Enrichment stays OFF for customer tenants in v1 (`enrichment_enabled` false) pending FullEnrich reseller terms; it remains enabled only on the internal-QA tenant. Payments are out of v1: the first customer is invoiced manually through Appadino.AI LLC.
+
+**Deferred** (explicitly NOT in v1, do not build): G2.9 client API / APIM / scoped keys / per-tenant enrichment caps in production; G3.x intake flow and config compiler (customer 1 is onboarded manually); authenticated admin backend; bulk enrichment; nonprofit-facing config (Phase 2); tenant isolation via row-level security, audit logging, data residency/retention policy, and resilience work beyond item 5; Entra External ID, Stripe, Front Door/WAF.
+
+**Scope-freeze rule:** anything new must either replace an item on the v1 list above or wait until v1 ships.
+
+---
+
+## 1. What this is
+
+A multi-tenant pipeline that ingests the national IRS nonprofit universe, applies a client's ICP as *configuration*, scores survivors with the Claude API, suppresses known contacts, optionally enriches approved prospects with verified contact data (candidate stage, pending validation — see §5.5), and produces a human-reviewable prospect list with citations. A web dashboard for review ships after the pipeline; an automated intake flow after that. Outreach is **always human-gated** — this system never sends anything autonomously.
+
+**Non-goals for Phase 1:** auth/billing/self-serve signup, CRM integrations, autonomous outreach, Track A/Track C tooling, mobile.
+
+**Prime directives:**
+1. **Absentee operation is a feature of the MVP**, not a nice-to-have: scheduled runs, failure alerts, config changes without deploys, automated QA. The operator will have limited, irregular hours indefinitely — every manual step is a permanent tax.
+2. **Resumability.** Build sessions are irregular and may be days apart. Every gate closes with the repo in a clean, documented state: passing tests, an updated `STATUS.md` (what's done, what's next, open questions), and no half-finished work on `main`. Any session must be able to start cold from `STATUS.md` in under five minutes.
+
+---
+
+## 2. Architecture
+
+```
+                        ┌──────────────────────────────────────────┐
+                        │  Azure Container Apps Job (scheduled)    │
+  IRS BMF (monthly CSV) │  "pipeline" — Python 3.12                │
+  990 e-file XML  ─────▶│  ingest → filter → signals → AI score →  │
+  ProPublica API        │  suppress → triggers → publish           │
+                        │  (→ enrich: candidate stage, flag-gated) │
+                        └───────────────┬──────────────────────────┘
+                                        │
+                         Azure Database for PostgreSQL
+                         Flexible Server (Burstable B1ms)
+                                        │
+                        ┌───────────────┴──────────────────────────┐
+                        │  Azure Static Web Apps (React)           │
+                        │  + built-in Functions API (Python)       │
+                        │  review table · statuses · CSV export    │
+                        └──────────────────────────────────────────┘
+
+  Secrets: Azure Key Vault (Anthropic key, DB conn string,
+           FullEnrich key if E-gates pass)
+  Telemetry/alerts: Application Insights → email alert rules
+  Scoring: Anthropic API — Haiku cheap pass, Sonnet deep pass,
+           via the Message Batches API (50% discount, fits overnight runs)
+```
+
+**Why these choices**
+- **Container Apps Job** over Functions for the pipeline: batch work with unbounded runtime, cron-scheduled, scales to zero, no 10-minute ceiling. One container, one entrypoint per stage.
+- **PostgreSQL Flexible Server (B1ms)**: real SQL for the staged filters, JSONB for ICP configs and extracted signals, ~$15/mo. SQLite would be cheaper but kills the multi-tenant story and concurrent dashboard access.
+- **Static Web Apps**: Duan's proven pattern (portfolio site, AlphaBot). Free tier fine for Phase 1.
+- **Batch API for scoring**: runs are overnight anyway; 50% off makes national-scale scoring a non-event cost-wise.
+- **API over file export** (client-integration handoff, not the dashboard): when a client's own downstream system — e.g. ARCHITECT's Operations app — needs to receive DiscoveryAI data on an ongoing basis, the decision is API delivery, not periodic flat-file drops. This is a **separate decision from the dashboard's own one-click CSV export button** (§5) — that button is a standard feature available to every customer regardless of enrichment tier, and this decision doesn't change it. Both have been called "file export" in conversation, which has caused real confusion between the two; this line exists to keep them distinct. The capability is the product offering; it isn't scoped to any one client's integration need.
+
+**G2.9 architecture decision:** this is now a scheduled deliverable, not just a standing principle. Azure API Management (Consumption tier — free up to 1M calls/month, ~$3.50/million after) sits in front of the Functions API, handling key issuance/rotation, rate limiting, and request analytics. APIM does NOT own any business logic — it's a gatekeeper, not a rule engine. Two scopes exist per client key: `read` (prospects data, matching CSV export) and `enrich` (triggers enrichment via the API). Critically: the monthly_enrichment_cap check happens in application code (the Functions API itself), not in APIM's policies — so even if a request successfully passes through APIM's gateway (correct key, under any rate limit), the app-level cap/scope check still runs and can still reject it. APIM controls whether a call reaches the app; it does not decide whether the call is allowed to succeed. This is a deliberate two-layer design, not redundant — APIM protects against volume/abuse at the network edge, the app-level check protects the shared FullEnrich credit pool regardless of how a request arrives (API, dashboard button, or any future entry point).
+
+**Estimated run cost:** Postgres ~$15/mo + Container Apps ~$2–5/mo + Claude API ~$10–40/full national run (see §6 token math) + SWA free + APIM Consumption tier (~free at current call volume, first 1M calls/month free, ~$3.50/million after) + FullEnrich (one-time $500/12,500-credit pack, 6-month validity, chosen reseller starter tier — only if E-gates pass, only on approved prospects; see §5.5). Well under the $399/mo Discovery price point, even fully loaded.
+
+---
+
+## 3. Multi-tenant data model
+
+`client_id` on every tenant-scoped table from row one. ICP is **data, not code** — onboarding customer #2 is an insert, not a deploy.
+
+```
+clients            id, name, status, created_at
+icp_configs        id, client_id, version, config JSONB, active bool, created_at
+                   -- full ICP: geography tiers, revenue band, excludes,
+                   -- disqualifiers, signal weights, alignment keywords,
+                   -- enrichment_enabled bool (default false),
+                   -- fullenrich_subaccount_id text NULL
+                   -- (set when enrichment_enabled = true; passed as the
+                   -- Sub-Account-Id header on FullEnrich v2 calls)
+                   -- monthly_enrichment_cap int (default 150)
+                   -- (checked by can_enrich() before any enrichment call
+                   -- succeeds — dashboard button and API alike, see §5.5)
+organizations      ein PK, name, state, city, ntee, ruling_year,
+                   revenue_latest, foundation_code, bmf_updated_at
+                   -- SHARED national universe (not tenant-scoped)
+filings            id, ein, tax_year, form_type, xml_object_url,
+                   revenue_total, contributions, program_revenue,
+                   govt_grants, fundraising_expense, officers JSONB,
+                   extracted_at
+signals            id, ein, tax_year, signal JSONB
+                   -- gov_funding_pct, revenue_composition, dd_present,
+                   -- fundraising_spend_ratio, org_age, revenue_trend
+scores             id, client_id, ein, icp_version, stage (haiku|sonnet),
+                   values_signals JSONB (5 separate scores + citations),
+                   alignment JSONB (criteria hit, 3-of-7),
+                   capacity JSONB (2 public criteria ONLY),
+                   gap_rank numeric, disqualified bool, dq_reason,
+                   soft_flags JSONB, scored_at
+suppression        id, client_id, ein NULL, org_name, kind
+                   (client|active_prospect|partner_attribution), source, added_at
+prospects          id, client_id, ein, status
+                   (new|reviewed|approved|rejected|contacted|responded),
+                   assigned_trigger, notes, updated_by, updated_at
+enrichments        id, client_id, ein, prospect_id, provider (fullenrich),
+                   contact_name, contact_title, email, email_status
+                   (verified|catch_all|not_found|stale_likely_moved),
+                   stale_detail, phone, linkedin_url,
+                   provider_confidence, raw JSONB, credits_spent,
+                   requested_at, completed_at, retention_expires_at
+                   -- populated ONLY for status=approved prospects,
+                   -- ONLY when icp_configs.enrichment_enabled = true
+                   -- retention_expires_at = completed_at + 90 days
+                   -- (FullEnrich reseller terms); dashboard flags expired rows
+runs               id, client_id NULL, stage, started_at, finished_at,
+                   status, counts JSONB, error
+qa_samples         id, run_id, ein, claim, citation_url, verdict, checked_at
+```
+
+---
+
+## 4. Pipeline stages (all technical risk lives here)
+
+**Stage 0 — Ingest (national, shared)**
+- Pull IRS Business Master File (all-states CSV), upsert into `organizations`. Monthly schedule.
+- ProPublica Nonprofit Explorer as the per-EIN detail/backfill source (free, no key).
+- 990 e-file XML index: fetch and store object URLs for target years (latest 2 filings per org).
+
+**Stage 1 — Cheap SQL recall filter (no AI, no per-org cost)**
+Wide net; err toward recall. From config, not code:
+- 501(c)(3) public charities only (`foundation_code` — exclude private foundations)
+- Revenue ≥ **$500K hard floor** (Lauren; watch list retired), ≤ configurable ceiling (default $10M)
+- Hard excludes: hospitals/health systems, universities, government/quasi-public, fiscally sponsored (no own 990), membership associations — implemented via foundation/affiliation codes + NTEE **for recall shaping only, never scoring** (Lauren: characteristics decide, sectors emerge)
+- Geography: **national**. Tier weights (Charlotte metro, Cincinnati metro = priority) applied at ranking, not as walls.
+
+**Stage 2 — 990 signal extraction (survivors only)**
+Parse latest 2 XML filings per survivor:
+- Revenue composition (contributions vs program vs govt) — **rank on gap**, composition over size
+- `govt_grants / total_revenue` → **soft flag** when heavy (federal awards can't fund fundraising consulting; threshold in config, default ≥40%)
+- Development-capacity readables: fundraising expense ratio, officer/staff titles containing development roles (Part VII)
+- Revenue trend across the 2 filings (growth/decline/transformational jump)
+- **Capacity scoring uses ONLY the 2 publicly readable criteria. Never emit "fully qualified" — the other 3 capacity criteria are unknowable from public data. Output language: "qualified pending discovery conversation."**
+
+**Stage 3 — AI scoring, two passes (Batch API)**
+- **Haiku pass** (all Stage-2 survivors): mission/program text from 990 + website title/description → cheap 0–100 pre-score on alignment keywords + obvious disqualifiers. Cut to top N (config, default 3,000).
+- **Sonnet pass** (top N): full five-signal values scoring, **each signal scored separately with citations**:
+  1. Leadership composition — **HARD RULE: never infer race/ethnicity/gender from names or photos. Cite published self-description only, or emit `needs_human_verification`.**
+  2. Population served
+  3. Mission language
+  4. Programming
+  5. Funder base (Phase 1: what's readable from 990 + website; grantmaker Schedule I trails are a Phase 2 plumbing item)
+- Strategic alignment: 3-of-7 framework from the spec, criteria hit-list with citations.
+- **Hard disqualifier:** primary need is grant writing → `disqualified=true`, reason recorded, never surfaced as a prospect.
+- Every scored claim carries a citation URL or document reference. **A blank cell beats a wrong cell. The pipeline never constructs or guesses email addresses.**
+
+**Stage 4 — Suppression**
+- Load ARCHITECT lists (seed data, then editable via dashboard): past/current clients — Butterfly Dreamz, Project OutPour, Our Tribe Cincy, Blue Bowtie Foundation, Queen City Cocoa B.E.A.N.S., Common Cause, WEMH, She Dreams in Color, LPCCD, CCIP, Clinton Hill Community Action, CBAC. Active prospects — LBFE Cincinnati, The Partnership Fund, Spring Clean, CCT Center for Community Transitions, Sanford Institute/National University.
+- Match on EIN where resolvable, fuzzy name match (flag, don't silently drop) where not.
+- Partner-attribution entries carry the 18-month window metadata (12% commission context lives in ARCHITECT's world, not ours; we just track the flag).
+
+**Stage 5 — Triggers (Phase 1 = filing-derived only)**
+- Diff latest vs prior filing: new ED/CEO name in Part VII, development-director disappearance, transformational revenue jump, first filing above floor.
+- Each trigger maps to an outreach *angle* (trigger→angle→offer table is a client-config asset; ships with ARCHITECT defaults: new ED → first-100-days; DD departure → Fractional/Interim DD; transformational grant → absorb-and-build; new strategic plan → fund-the-plan). **Lauren's rule: the trigger shapes the message, it doesn't just confirm timing.** Website/news-based triggers (48-hour standard) are Phase 2.
+
+**Stage 6 — Publish**
+- Upsert `prospects` (status `new`), compute `gap_rank` ordering, write run record, emit CSV to blob + dashboard.
+
+---
+
+## 5.5. Candidate stage — FullEnrich contact enrichment (NOT yet committed scope)
+
+**Status: unvalidated, commercial terms confirmed.** This stage ships dark (feature flag off, no cron trigger) until the E-gates in §8 pass. It does not block, delay, or entangle any other gate. Reseller terms with FullEnrich were confirmed by Hugo (FullEnrich) on Sept 15, 2026, pending final package lock on a Friday follow-up call — the technical design below reflects those terms.
+
+**What it would do:** for prospects a human has marked `approved` in the dashboard, call the FullEnrich API (waterfall enrichment across upstream providers) to retrieve decision-maker contact data — verified email, phone, LinkedIn — and store results in `enrichments`.
+
+**Placement rationale — after human approval, not after scoring:**
+- FullEnrich bills per enrichment credit. Enriching only approved prospects means paying for tens of contacts per run, not thousands.
+- It keeps the human gate upstream of any contact-data acquisition: no contact data exists for an org until a person has decided it belongs on the list.
+- Scoring stays 100% public-source and citation-backed; enrichment is a separate, clearly-labeled data class that never feeds back into scores.
+
+**Access model — Reseller Agreement, not self-serve.** FullEnrich's standard ToS prohibits delivering enriched data to third parties (i.e., our clients) from one account. Multi-client delivery on this architecture requires their standard Reseller Agreement — fixed terms, no enterprise procurement cycle, no redlines expected. A written OK on a self-serve Pro plan is not sufficient on its own; the Reseller Agreement is the actual vehicle. This resolves the rule-3 reconciliation question below in FullEnrich's favor.
+
+**Sub-accounts.** One Appadino parent workspace, one API key. Each client gets a FullEnrich sub-account, passed as a `Sub-Account-Id` header on v2 API calls — `icp_configs.fullenrich_subaccount_id`, set alongside `enrichment_enabled` when a tenant is onboarded to enrichment. History, cache, and logs isolate per sub-account on FullEnrich's side; billing draws from one pooled Appadino credit balance, so consolidated billing and per-client compliance isolation both hold at once. Sub-account provisioning is manual for Phase 1 (client count is low); revisit API-driven provisioning in Phase 2 if client count grows.
+
+**Spend cap.** `icp_configs.config.monthly_enrichment_cap` (integer, default 150) bounds enrichment spend per tenant per month, checked by `can_enrich()` (or a wrapper around it) before any enrichment call succeeds — the dashboard's per-prospect "Enrich" button and the G2.9 API's `enrich`-scoped endpoint both go through this same check, so the cap can't be bypassed by using one entry point over the other. The 150 default is sized against FullEnrich's real per-credit cost ($500/12,500 credits = $0.04/credit; up to 11 credits for a full email+phone contact, ~$0.44) to stay well under a ~20%-of-$399/mo cost guideline even at worst-case per-contact cost.
+
+**Retention.** Delivered personal data carries a mandatory 90-day retention/refresh policy under the reseller terms. `enrichments.retention_expires_at` = `completed_at` + 90 days; the dashboard visually flags or grays out any contact past that window rather than treating it as permanently valid. Re-enrichment after expiry consumes a fresh credit.
+
+**Vertical scope — confirmed by FullEnrich.** Standard B2B professional-contact use (institutional donors, foundation directors, CSR leads, officials acting in a professional capacity) is fully supported. Consumer political profiling and voter data are explicitly excluded (GDPR Art. 9) — outside this system's scope regardless, but useful as written vendor confirmation for Lauren's sign-off.
+
+**Pricing — chosen tier.** ~$500 one-time for a 12,500-credit pack, valid 6 months, no recurring commitment. Chosen over the ~$250/mo annual-commit tier (10,000 credits/month, ~$3,000/year obligation) because it's a single bounded spend sized to current volume — one pilot client, pre-E1 — rather than a 12-month commitment made before gate E1 has validated real match rates and cost-per-contact. Revisit the recurring tier once client volume actually justifies 10,000+ credits/month; upgrading later carries no per-client renegotiation. Final package terms confirmed on a Friday follow-up call with FullEnrich.
+
+**Rule reconciliation (needs Duan + Lauren sign-off — flag for the Wednesday Sept 16 scoping call):**
+v1.0 hard rule 3 said "no data-broker sources," written to ban *guessed* emails and sketchy scrapes in the scoring layer. FullEnrich is different in kind — verified, consented-workflow B2B enrichment, now under a confirmed reseller agreement rather than a gray-area account — but it is still third-party contact data, so adopting it is a deliberate amendment, not a loophole. The amended rule (§9.3) permits enrichment-API results only when: provider and confidence are stored with every record, `email_status` ≠ verified is visually flagged in the dashboard, retention expiry is tracked and surfaced, and nothing is ever pattern-guessed. If Lauren objects to any third-party contact data for ARCHITECT's tenant, `enrichment_enabled` stays false for them — it's per-tenant config, not a platform decision.
+
+**Validation spike (gate E1) measures, on ~25 real approved prospects:**
+1. Match rate (found a decision-maker contact at all)
+2. Verified-email rate vs catch-all/not-found
+3. Cost per *usable* contact (credits ÷ verified emails)
+4. Accuracy spot-check: Duan manually verifies 10 results
+5. API ergonomics: sub-account header behavior, async webhook vs polling, rate limits, bulk endpoint fit
+
+**Adoption threshold (tune after seeing data):** ≥60% match rate, ≥70% of matches verified, cost per usable contact comfortably inside the confirmed $500/12,500-credit package — well within the $399/mo Discovery price point even fully loaded. Below threshold → stage stays dark, revisit providers in Phase 2.
+
+---
+
+## 5. Dashboard
+
+React on Static Web Apps, Functions API over Postgres:
+- Prospect review table: rank, org, revenue, composition, five signal scores with expandable citations, alignment hits, soft flags, trigger
+- Status workflow: new → reviewed → approved / rejected (checkbox-fast), notes field
+- Suppression manager (add/remove entries)
+- Outreach queue **stub**: approved prospects listed with assigned trigger/angle — drafting and sending are Phase 2, human-gated by design
+- **Contact columns** (v2.3, supersedes the earlier flag-gated "Enrichment column" design) — five separate columns, not a combined cell:
+  - **Name** and **Title**: always visible, for every customer, for every prospect — free, sourced from the org's own latest 990 filing officers (`filings.officers`), clearly labeled as unverified (self-reported on a tax filing, not confirmed by any enrichment provider). Not gated by `enrichment_enabled` — this is public data already used elsewhere in the pipeline (Stage 2 development-capacity signals), not third-party contact data, so it doesn't touch hard rules 3/8 (§9).
+  - **Email**, **Phone**, **Status**: empty/locked by default. A human explicitly triggers enrichment via a per-prospect "Enrich" button on an `approved` prospect; only then do these three populate from `enrichments`, with a status badge and provider + confidence on hover. §5.5's guards (`enrichment_enabled`, `fullenrich_subaccount_id`, `approved`-only) and §9 rule 8 still gate whether the Enrich trigger *fires* — they don't affect whether Name/Title render. Batch auto-enrich remains E2-only.
+  - **Status is a four-way bucket, not three (v2.4):** `verified` / `catch_all` / `not_found` / **`stale_likely_moved`**. The fourth bucket covers a match FullEnrich reports as findable/verified whose email domain doesn't belong to the org being prospected — real signal, not a failure state (E1's Day One finding: an officer's email resolved to a different, current employer's domain). Set by comparing the enriched email's domain against the org's own website domain, with the mismatched domain surfaced as `stale_detail` for the dashboard tooltip.
+  - **Real-vs-verified confidence signal (v2.4, resolves the E1-close open item):** the same domain comparison above *is* the confidence signal — it doesn't need a separate mechanism from staleness. The one thing that comparison must not do naively: a domain-only check would misread an unpaid board volunteer's real, current personal email (gmail, yahoo, etc.) as "moved," since volunteers routinely list a personal address on the 990 even when their role is completely current. Personal-domain matches are excluded from the mismatch inference entirely and keep FullEnrich's own reported status untouched.
+  - **Open question for Duan, still open in v2.4:** the E1 spike found FullEnrich sometimes resolves a more accurate identity than the raw 990 text (e.g. 990 listed "Lundin Sarah"; FullEnrich matched a LinkedIn profile and returned "Sarah Lundin"). Undecided: does a confirmed enrichment ever update Name/Title, or do they always stay as the original unverified 990 entry regardless of what Email/Phone/Status resolve to? E2 doesn't resolve this — Name/Title always track the *current* latest-filing officer, independent of enrichment history — but does now surface a `contact_mismatch` flag when the two diverge (e.g. an org's leadership changed since its last enrichment), so a reviewer sees the divergence instead of the dashboard silently implying the enriched contact info belongs to whoever Name/Title currently shows.
+  - Applies identically to the dashboard table and the CSV export (below).
+- CSV export button (Lauren's spreadsheet, one click; same five contact columns as the table — Name/Title always populated, Email/Phone/Status empty/locked unless individually enriched)
+- Run history + last-run health banner
+- Multi-tenant from day one: client switcher hidden behind a config flag; single-tenant deployment
+
+## 6. Intake + dogfood
+
+- AlphaBot-style intake: questionnaire + document upload → Claude compiles a draft `icp_config` JSON → **Duan reviews every config before first run** (config-as-data makes this a review, not a build)
+- Write the **Appadino dogfood config**: target = nonprofit/fundraising consultancies (990 Part VII contractor tables >$100K, Schedule G fundraising counsel, state charitable-solicitation registries, AFP chapter directories) → generate the customer-2/3 prospect list with the same pipeline
+- Token math checkpoint: Haiku pass ~50K orgs × ~1.5K tokens ≈ $10–20 batched; Sonnet pass 3K orgs × ~4K tokens ≈ $20–40 batched. Verify actuals, tune N.
+
+## 7. Absentee + irregular-session operation (built in from gate one, not bolted on)
+
+- Cron schedules on the Container Apps Job (monthly BMF, weekly score refresh)
+- App Insights alert rules → email on run failure, zero-output runs, cost anomalies
+- All thresholds/weights/tiers in `icp_configs` — changes are DB updates, zero deploys
+- **QA job:** every run samples 20 scored claims into `qa_samples`, re-fetches each citation, verdicts match/mismatch; mismatch rate >10% pages Duan. This is the automated stand-in for "Duan reads the output."
+- **`STATUS.md` discipline:** Claude Code updates it as the final commit of every gate — done / next / open questions / any decision awaiting Duan. It is the session-start document. A gate is not closed while `STATUS.md` is stale.
+
+---
+
+## 8. Sequenced gates (no calendar attached)
+
+Gates advance strictly in order within a track; Duan reviews and approves each before the next begins. Copilot writes tests per commit (pytest for pipeline, minimal Playwright smoke for dashboard). Sessions are irregular — a gate can span one night or two weeks, and that is fine by design.
+
+| Gate | Scope | Acceptance |
+|---|---|---|
+| **G1.1** Repo + infra | Bicep for RG, Postgres, Key Vault, Container Apps env, App Insights; CI via GitHub Actions; `STATUS.md` created | infra deploys clean; secrets in KV; hello-world job runs on schedule |
+| **G1.2** Ingest | BMF loader, ProPublica client, 990 XML index + fetch | national `organizations` populated; row counts logged; idempotent re-run |
+| **G1.3** Filters + signals | Stage 1 SQL from config; Stage 2 XML parser | survivor counts per stage logged; spot-check 10 orgs by hand |
+| **G1.4** Scoring | Haiku + Sonnet batch scoring, five-signal output, citations, DQ rules | 100-org pilot batch reviewed by Duan; zero demographic inferences; every claim cited |
+| **G1.5** Suppress + triggers + publish | Stages 4–6, CSV out, QA job, alerts | ARCHITECT seed suppression verified; end-to-end national run completes unattended |
+| **G2.x** Dashboard | table → statuses → suppression UI → export → run health | Lauren-usable without training; CSV matches POC format |
+| **G2.9** Client API *(deferred past v1)* | Azure API Management (Consumption tier) in front of the existing Functions API; scoped per-client keys (`read` vs `enrich` scopes, not one flat credential); read-only prospects endpoint matching CSV export's data; enrichment-scope calls additionally gated by a per-tenant monthly_enrichment_cap enforced in application code | A real customer can pull their own prospect list programmatically with a scoped credential; APIM handles key issuance, rate limiting, and throttling; a customer's enrich-scoped key cannot exceed its tenant's monthly cap regardless of call volume or rate |
+| **E1** FullEnrich spike | standalone script, no pipeline integration: enrich ~25 approved prospects, capture §5.5 metrics | Duan reviews metrics against adoption threshold; go/no-go recorded in `STATUS.md` |
+| **E2** Enrichment stage *(only if E1 = go)* | `enrichments` table live, per-prospect Enrich button, provider adapter behind an interface (FullEnrich first, swappable), flag-gated | enrichment never fires on non-approved prospects (tested); sub-account ID passed on every call; credits logged per call; `retention_expires_at` set and surfaced in dashboard; ARCHITECT tenant flag set per Lauren's decision |
+| **G3.x** Intake + dogfood *(deferred past v1)* | intake flow → config compiler → dogfood run | customer-2 prospect list exists; Duan approved dogfood config |
+| **G4** Hardening | fixes, docs, runbook | runbook lets a low-availability operator run everything in <2 hrs/mo |
+
+**Ordering notes:** E1 can run any time after G2.x produces approved prospects (it needs real approvals to enrich). It is deliberately parallel-safe — a standalone script — so it can be a "small session" task. E2 slots in whenever E1 passes; if E1 fails, delete both E-rows and nothing else moves.
+
+**G2.9 ordering note:** G2.9's `read` scope has no dependency on the E-gates and can be built/tested any time. The `enrich` scope and `monthly_enrichment_cap` enforcement depend on E2's concepts (`enrichment_enabled`, `fullenrich_subaccount_id`, `can_enrich()`) already existing — don't build or test the `enrich` scope until E2 is accepted, even if G2.9 is otherwise complete.
+
+**Wednesday Sept 16 scoping call checkpoint:** demo whatever exists at that point — no gate is pinned to it. Committed deliverable stays "scored national pipeline your team reviews." Reseller terms with FullEnrich are now confirmed, so if enrichment comes up, present it as "evaluating a verified-contact layer, commercial terms settled" — still not committed until E1 passes. Anything new from the call goes to the Phase 2 list unless it displaces something in this brief.
+
+---
+
+## 9. Hard rules (encode as tests, not comments)
+
+1. Never infer race/ethnicity/gender from names or photos — published self-description or `needs_human_verification`.
+2. Never emit "fully qualified." Capacity = 2 public criteria + "pending discovery conversation."
+3. Never construct, guess, or pattern-generate contact emails anywhere in the system. Blank beats wrong. Third-party contact data enters *only* through the flag-gated enrichment stage (§5.5), only for approved prospects, always stored with provider + confidence + verification status + retention expiry. No scraping, no guessed patterns, no other data sources.
+4. Every scored claim cites a source. Enrichment data is never a scoring input.
+5. No autonomous outreach paths — the outreach queue has no send capability in Phase 1 at all.
+6. NTEE never appears in scoring inputs (recall shaping only).
+7. Suppressed orgs never surface, and fuzzy suppression matches surface as flags, not silent drops.
+8. Enrichment never fires on a prospect whose status is not `approved`, never when the tenant's `enrichment_enabled` flag is false, never when the tenant's `fullenrich_subaccount_id` is unset, and never when `can_enrich()` reports the tenant's `monthly_enrichment_cap` already met — checked identically regardless of entry point (dashboard button or G2.9 API).
+
+## 10. Risks
+
+- **990 XML variance** (schema versions, missing parts) → parser tolerates absence; signals nullable; coverage % logged per run.
+- **Filing lag 12–18 months** → fine for qualification, weak for timing; set that expectation with Lauren (already in the v3 doc).
+- **Haiku cut too aggressive** → keep cut threshold in config; log score distribution; Duan reviews the boundary band on the pilot batch.
+- **Irregular sessions → context loss** → mitigated by `STATUS.md` discipline, one-gate-at-a-time, and clean-main rule. If it fails anyway, the fix is smaller gates, not longer sessions.
+- **Enrichment scope creep** → E-gates are the only door. No enrichment code touches the pipeline before E1 passes; no auto-enrichment before E2 acceptance.
+- **Retention compliance** → FullEnrich reseller terms require refreshing delivered personal data after 90 days; `retention_expires_at` tracking and dashboard flagging (§5.5) are the enforcement mechanism, tested in E2 acceptance.
+- **Lauren declines third-party contact data** → per-tenant flag makes this a config value, not a fork. Dogfood tenant can still use it.
+- **Scope creep from the Sept 16 call** → anything new goes to the Phase 2 list unless it displaces something in this brief.
+
+---
+
+## 11. Claude Code kickoff prompt
+
+> You are the implementer for `appadino-discovery`, working from `discovery-phase1-implementation-brief-v2.7.md` at repo root. Work gate by gate (§8), strictly in sequence, one scoped commit per gate item, conventional commit messages. Never start the next gate before I approve the current one. My sessions are irregular and may be days apart: end every gate with passing tests, a clean `main`, and an updated `STATUS.md` (done / next / open questions / decisions awaiting me) — assume the next session starts cold from that file. Python 3.12, type-hinted, pytest per module; infra as Bicep in `/infra`; config never hardcoded — everything tenant-variable lives in `icp_configs.config`. The hard rules in §9 are test cases first. The enrichment stage (§5.5, gates E1/E2) is candidate scope: write zero enrichment code unless I explicitly open gate E1. Start with G1.1: propose the repo layout and the Bicep plan, then wait for my review.
+
+---
+*Owner: Duan Walker, Appadino AI LLC · Architect of record: Claude · v2.7, October 2026 (supersedes v2.6 — Duan decided to launch a managed-service v1 for the first customer; everything else deferred — see "v1 launch scope (frozen)")*

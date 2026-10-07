@@ -61,76 +61,92 @@ _Session-start document. Read this first — see the implementation brief (`disc
 
 ## Next
 
-**Before G1.5 can be considered fully accepted**: a real full-national `filter 2` run against `adisc-dev-pipeline-job` surfaced two distinct problems this session (2026-10-01 to 2026-10-03) — one now fixed and validated, one still open.
+**Decision (Duan, 2026-10-07): launch a managed-service v1 for the first customer.** Everything else is deferred — see `discovery-phase1-implementation-brief-v2.7.md`'s new **"v1 launch scope (frozen)"** section for the full decision record (G2.9/G3.x marked deferred past v1 in the gate table). The checklist below is that same v1 done list, unchecked, in order. **Scope-freeze rule: anything new must either replace an item on this list or wait until v1 ships.**
 
-**Fixed and validated — the connection-drop bug.** `extract_signals_for_survivors()` held one psycopg connection open for the whole Stage 2 run; at ~119k survivors it got dropped deep in the per-filing loop ("server closed the connection unexpectedly"). Root cause: the original crash (the one `runs` row id=12, 2026-09-23, actually recorded — 57m25s, `survivors: 119218`) turned out to have run **locally** from an earlier Claude Code session, not via the Container Apps Job — its `archive_manifest` rows (all 37 of them, writing Windows scratchpad paths as `local_path`) proved it, and blocked every later run including this session's first real attempt until deleted. So the likely cause is local-network instability on a single long-lived connection, not any Azure-side timeout — `idle_in_transaction_session_timeout`/`statement_timeout` are both off, and there's no NAT gateway or proxy in the path. Fix: `extract_signals.py`'s new `_ReconnectingConnection` retries a dropped connection with backoff and proactively cycles the connection every 2000 filings, so the run no longer depends on one connection surviving it. **Proven live**: a real `filter 2` execution via the Container Apps Job (image rebuilt with the fix, `replicaTimeout` raised 3600→14400s to give it room) ran for a full 4 hours, processed 30,000+/243,448 filings, and hit **zero connection-related failures** — only normal §10-tolerated per-filing parse failures. The one-off CLI override path (`az containerapp job start --args`/`--command`/`--yaml`) proved unreliable in this az CLI version (each either dropped secrets/volumes/resources or silently dropped the command override) — the working approach was a temporary `args` change in `containerAppsJob.bicep`, deployed, triggered with a plain `job start`, then reverted — documented here in case a future one-off national-scale trigger is needed again.
+- [ ] **1. Stage 2 closed**: real-Postgres integration tests pass (local scratch Postgres or CI); live regression diff on the 154 pilot orgs is empty; sampled throughput run recorded with STAGE2_TIMING breakdown and peak memory; a national Stage 2 run projects to finish unattended and resumably.
 
-**Stage 2 throughput + resumability — code changed across two sessions (2026-10-03/04), NOT yet validated against the live DB.** The 4-hour test above measured ~2.2–2.5 filings/sec (consistent across 5 checkpoints), implying ~29h for the full 243,448-filing run. `extract_signals.py` now has:
-- **Cached zip handles**: `fetch_filing_xml` takes an optional `archive_cache` dict; `extract_signals_for_survivors` keeps one open per archive for the run's duration (closed in `finally`, even on an unhandled exception — see the handle-cache-closes-on-error test) instead of reopening + re-parsing each archive's central directory on every filing. `build_year_index` is unchanged apart from the fail-fast check below.
-- **Streaming per EIN**: at most 2 parsed filings held in memory at a time (the old whole-run `parsed_by_ein` dict is gone) — a signal is computed and queued the moment an EIN's rows (ordered `ein, tax_year DESC`) are exhausted. Verified against the old behavior exactly: single-filing EIN, first-filing-fails-second-parses, and >2-filings-only-first-2-used are all explicit tests.
-- **EIN-level resumability, now tax_year-aware (2026-10-04 review follow-up)**: an EIN is skipped only if its *latest* `signals` row's tax_year is already `>=` its *latest* `filings` row's tax_year — not just "has ever had a signal computed" (the first version of this check, which would have silently left an EIN's newer filing never reflected in its signal once that EIN had any signal at all). An EIN that gets a newer filing after its signal was computed is now correctly reprocessed. `--force-refresh-signals` (CLI) / `force_recompute=True` still bypasses the check entirely. An EIN whose latest filing permanently fails to parse is retried every run — accepted cost, not silently given up on. `_flush_stage2_batch` still always commits a signal together with the filings rows it came from, in one transaction, so "caught up" reliably implies "its filings are actually committed too."
-- **Fewer round trips**: `ruling_year` comes from a `filings LEFT JOIN organizations` in the one filing-rows query; filings UPDATEs / website backfill / signals upserts are buffered and sent via `executemany` + one commit every `STAGE2_BATCH_COMMIT_EVERY_FILINGS` (500) filings or at the run's end.
-- **Manifest hardening (2026-10-04 review follow-up, closes the "not yet hardened" item from the first pass)**: `build_year_index` and `fetch_filing_xml` now call `_require_archive_on_disk` before opening any `archive_manifest` local_path — if the file genuinely isn't there, they raise `ArchiveFileMissingError` naming the exact year/month/suffix (`build_year_index`) or object_id (`fetch_filing_xml`) and the path, rather than a bare `FileNotFoundError` or (worse) silently corrupting state. Deliberately does NOT auto-delete the manifest row or re-download — either would paper over whatever desynced the cache from the manifest instead of surfacing it (exactly the failure mode that bit the connection-drop investigation above). This error is NOT tolerated like an ordinary per-filing parse failure — it's explicitly re-raised past the §10 per-filing `except Exception`, so it stops the run instead of silently degrading `coverage_pct`.
-- **Deterministic survivor order (2026-10-04 review follow-up)**: `build_survivor_query` (filter.py) now ends in `ORDER BY o.ein` — without it, Postgres makes no ordering guarantee, so `--limit-eins` could silently sample a different subset of the same survivor set on every run.
-- **`--eins` CLI override (2026-10-04 review follow-up)**: `discovery filter <client_id> --eins 111111111,222222222,...` replaces Stage 1 + suppression entirely for that run — Stage 2 runs on exactly the given EINs (e.g. a pilot client's exact org list), independent of whatever Stage 1's recall filter currently selects. Logged as `OVERRIDE` and recorded in `runs.counts` (`eins_overridden: true`) so it's never mistaken for an ordinary run in the `runs` table. Combinable with `--limit-eins` (truncates the override list) and `--force-refresh-signals`.
-- **Opt-in timing breakdown**: `STAGE2_TIMING=1` in the job's env accumulates zip-read / parse / db-write wall-clock seconds and logs them on the existing progress line.
-- **Bounded-sample CLI**: `discovery filter <client_id> --limit-eins N [--force-refresh-signals] [--eins ...]` truncates the survivor set to N EINs (~1-2 filings each) before Stage 2.
+  **Fixed and validated — the connection-drop bug.** `extract_signals_for_survivors()` held one psycopg connection open for the whole Stage 2 run; at ~119k survivors it got dropped deep in the per-filing loop ("server closed the connection unexpectedly"). Root cause: the original crash (the one `runs` row id=12, 2026-09-23, actually recorded — 57m25s, `survivors: 119218`) turned out to have run **locally** from an earlier Claude Code session, not via the Container Apps Job — its `archive_manifest` rows (all 37 of them, writing Windows scratchpad paths as `local_path`) proved it, and blocked every later run including this session's first real attempt until deleted. So the likely cause is local-network instability on a single long-lived connection, not any Azure-side timeout — `idle_in_transaction_session_timeout`/`statement_timeout` are both off, and there's no NAT gateway or proxy in the path. Fix: `extract_signals.py`'s new `_ReconnectingConnection` retries a dropped connection with backoff and proactively cycles the connection every 2000 filings, so the run no longer depends on one connection surviving it. **Proven live**: a real `filter 2` execution via the Container Apps Job (image rebuilt with the fix, `replicaTimeout` raised 3600→14400s to give it room) ran for a full 4 hours, processed 30,000+/243,448 filings, and hit **zero connection-related failures** — only normal §10-tolerated per-filing parse failures. The one-off CLI override path (`az containerapp job start --args`/`--command`/`--yaml`) proved unreliable in this az CLI version (each either dropped secrets/volumes/resources or silently dropped the command override) — the working approach was a temporary `args` change in `containerAppsJob.bicep`, deployed, triggered with a plain `job start`, then reverted — documented here in case a future one-off national-scale trigger is needed again.
 
-416/416 tests passing, ruff/mypy clean (`ruff check .` + `mypy src`, this project's documented commands — see `pipeline/README.md`).
+  **Stage 2 throughput + resumability — code changed across two sessions (2026-10-03/04), NOT yet validated against the live DB.** The 4-hour test above measured ~2.2–2.5 filings/sec (consistent across 5 checkpoints), implying ~29h for the full 243,448-filing run. `extract_signals.py` now has:
+  - **Cached zip handles**: `fetch_filing_xml` takes an optional `archive_cache` dict; `extract_signals_for_survivors` keeps one open per archive for the run's duration (closed in `finally`, even on an unhandled exception — see the handle-cache-closes-on-error test) instead of reopening + re-parsing each archive's central directory on every filing. `build_year_index` is unchanged apart from the fail-fast check below.
+  - **Streaming per EIN**: at most 2 parsed filings held in memory at a time (the old whole-run `parsed_by_ein` dict is gone) — a signal is computed and queued the moment an EIN's rows (ordered `ein, tax_year DESC`) are exhausted. Verified against the old behavior exactly: single-filing EIN, first-filing-fails-second-parses, and >2-filings-only-first-2-used are all explicit tests.
+  - **EIN-level resumability, now tax_year-aware (2026-10-04 review follow-up)**: an EIN is skipped only if its *latest* `signals` row's tax_year is already `>=` its *latest* `filings` row's tax_year — not just "has ever had a signal computed" (the first version of this check, which would have silently left an EIN's newer filing never reflected in its signal once that EIN had any signal at all). An EIN that gets a newer filing after its signal was computed is now correctly reprocessed. `--force-refresh-signals` (CLI) / `force_recompute=True` still bypasses the check entirely. An EIN whose latest filing permanently fails to parse is retried every run — accepted cost, not silently given up on. `_flush_stage2_batch` still always commits a signal together with the filings rows it came from, in one transaction, so "caught up" reliably implies "its filings are actually committed too."
+  - **Fewer round trips**: `ruling_year` comes from a `filings LEFT JOIN organizations` in the one filing-rows query; filings UPDATEs / website backfill / signals upserts are buffered and sent via `executemany` + one commit every `STAGE2_BATCH_COMMIT_EVERY_FILINGS` (500) filings or at the run's end.
+  - **Manifest hardening (2026-10-04 review follow-up, closes the "not yet hardened" item from the first pass)**: `build_year_index` and `fetch_filing_xml` now call `_require_archive_on_disk` before opening any `archive_manifest` local_path — if the file genuinely isn't there, they raise `ArchiveFileMissingError` naming the exact year/month/suffix (`build_year_index`) or object_id (`fetch_filing_xml`) and the path, rather than a bare `FileNotFoundError` or (worse) silently corrupting state. Deliberately does NOT auto-delete the manifest row or re-download — either would paper over whatever desynced the cache from the manifest instead of surfacing it (exactly the failure mode that bit the connection-drop investigation above). This error is NOT tolerated like an ordinary per-filing parse failure — it's explicitly re-raised past the §10 per-filing `except Exception`, so it stops the run instead of silently degrading `coverage_pct`.
+  - **Deterministic survivor order (2026-10-04 review follow-up)**: `build_survivor_query` (filter.py) now ends in `ORDER BY o.ein` — without it, Postgres makes no ordering guarantee, so `--limit-eins` could silently sample a different subset of the same survivor set on every run.
+  - **`--eins` CLI override (2026-10-04 review follow-up)**: `discovery filter <client_id> --eins 111111111,222222222,...` replaces Stage 1 + suppression entirely for that run — Stage 2 runs on exactly the given EINs (e.g. a pilot client's exact org list), independent of whatever Stage 1's recall filter currently selects. Logged as `OVERRIDE` and recorded in `runs.counts` (`eins_overridden: true`) so it's never mistaken for an ordinary run in the `runs` table. Combinable with `--limit-eins` (truncates the override list) and `--force-refresh-signals`.
+  - **Opt-in timing breakdown**: `STAGE2_TIMING=1` in the job's env accumulates zip-read / parse / db-write wall-clock seconds and logs them on the existing progress line.
+  - **Bounded-sample CLI**: `discovery filter <client_id> --limit-eins N [--force-refresh-signals] [--eins ...]` truncates the survivor set to N EINs (~1-2 filings each) before Stage 2.
 
-**Why "not yet validated" rather than "done": this session's sandbox hard-blocks any Bash command that fetches or uses the Key Vault DB connection string** (a classifier-level denial, not a permission prompt). None of the following happened yet: the step-0 timing breakdown on real filings, a real throughput run for before/after filings/sec + peak RSS, or the regression snapshot diff.
+  416/416 tests passing, ruff/mypy clean (`ruff check .` + `mypy src`, this project's documented commands — see `pipeline/README.md`). **Still no real-Postgres integration test suite** (item 1's own first clause) — the above is all unit-tested against hand-rolled fakes, not a real local scratch/CI Postgres; that's still outstanding, not just the live-DB validation below.
 
-**Duan: throughput MUST be measured via `adisc-dev-pipeline-job`, not a local run — the Azure Files SMB mount this fix targets only exists there** (`ARCHIVE_CACHE_DIR` falls back to local disk when nothing's mounted, per `pipeline/README.md` — a local run would read local disk and tell you nothing about the real SMB-latency question). Exact steps, none of which I ran myself (no Key Vault/DB access from my side):
+  **Why "not yet validated" rather than "done": this session's sandbox hard-blocks any Bash command that fetches or uses the Key Vault DB connection string** (a classifier-level denial, not a permission prompt). None of the following happened yet: the step-0 timing breakdown on real filings, a real throughput run for before/after filings/sec + peak RSS, or the regression snapshot diff.
 
-1. **Regression snapshot BEFORE deploying**, from your own machine (needs the real DB) — write the exact EIN list you're diffing to a file first (e.g. the pilot client's orgs), since `--client-id` snapshots that client's *entire current Stage 1 survivor set* (large, and not necessarily the same set across two runs — see the corrected docstring in `snapshot_stage2_outputs.py`), not a fixed regression-diff-sized cohort:
-   ```powershell
-   python pipeline/scripts/snapshot_stage2_outputs.py --eins-file pilot_eins.txt --out before.json
-   ```
+  **Duan: throughput MUST be measured via `adisc-dev-pipeline-job`, not a local run — the Azure Files SMB mount this fix targets only exists there** (`ARCHIVE_CACHE_DIR` falls back to local disk when nothing's mounted, per `pipeline/README.md` — a local run would read local disk and tell you nothing about the real SMB-latency question). Exact steps, none of which I ran myself (no Key Vault/DB access from my side):
 
-2. **Temporarily edit `infra/modules/containerAppsJob.bicep`** — add `STAGE2_TIMING` to the container's `env` array and an `args` override to the container spec (the image's `ENTRYPOINT`/`CMD` is `python -m discovery.cli ingest`; `args` overrides `CMD` for one run, same mechanism as the connection-fix validation run):
-   ```bicep
-   containers: [
-     {
-       name: 'pipeline'
-       image: image
-       args: [
-         'filter'
-         '2'
-         '--eins-file'   // or '--limit-eins', '5000', for a quick throughput read
+  1. **Regression snapshot BEFORE deploying**, from your own machine (needs the real DB) — write the exact EIN list you're diffing to a file first (e.g. the pilot client's orgs), since `--client-id` snapshots that client's *entire current Stage 1 survivor set* (large, and not necessarily the same set across two runs — see the corrected docstring in `snapshot_stage2_outputs.py`), not a fixed regression-diff-sized cohort:
+     ```powershell
+     python pipeline/scripts/snapshot_stage2_outputs.py --eins-file pilot_eins.txt --out before.json
+     ```
+
+  2. **Temporarily edit `infra/modules/containerAppsJob.bicep`** — add `STAGE2_TIMING` to the container's `env` array and an `args` override to the container spec (the image's `ENTRYPOINT`/`CMD` is `python -m discovery.cli ingest`; `args` overrides `CMD` for one run, same mechanism as the connection-fix validation run):
+     ```bicep
+     containers: [
+       {
+         name: 'pipeline'
+         image: image
+         args: [
+           'filter'
+           '2'
+           '--eins-file'   // or '--limit-eins', '5000', for a quick throughput read
+           ...
+         ]
+         env: [
+           // ...existing entries...
+           {
+             name: 'STAGE2_TIMING'
+             value: '1'
+           }
+         ]
          ...
-       ]
-       env: [
-         // ...existing entries...
-         {
-           name: 'STAGE2_TIMING'
-           value: '1'
-         }
-       ]
-       ...
-   ```
-   (the CLI has no `--eins-file`, only `--eins <comma-list>` — paste the pilot EINs inline as one `args` string if going that route, or use `--limit-eins N` for a throughput-only sample that doesn't need an exact list.)
+     ```
+     (the CLI has no `--eins-file`, only `--eins <comma-list>` — paste the pilot EINs inline as one `args` string if going that route, or use `--limit-eins N` for a throughput-only sample that doesn't need an exact list.)
 
-3. **Redeploy and trigger** (same approach as the connection-fix validation session — a one-off `az containerapp job start --args` override proved unreliable in this az CLI version):
-   ```powershell
-   az deployment group create -g rg-appadino-discovery-dev -f infra/main.bicep -p infra/main.bicepparam -p postgresAdminPassword=$pw
-   az containerapp job start --name adisc-dev-pipeline-job --resource-group rg-appadino-discovery-dev
-   ```
+  3. **Redeploy and trigger** (same approach as the connection-fix validation session — a one-off `az containerapp job start --args` override proved unreliable in this az CLI version):
+     ```powershell
+     az deployment group create -g rg-appadino-discovery-dev -f infra/main.bicep -p infra/main.bicepparam -p postgresAdminPassword=$pw
+     az containerapp job start --name adisc-dev-pipeline-job --resource-group rg-appadino-discovery-dev
+     ```
 
-4. **Read the results from the job execution's log stream**: filings/sec from the existing progress log line's cadence, the `zip_read`/`parse`/`db_write` seconds breakdown from the same line (STAGE2_TIMING=1), peak RSS from the Container Apps Job's own metrics (not something the app logs itself).
+  4. **Read the results from the job execution's log stream**: filings/sec from the existing progress log line's cadence, the `zip_read`/`parse`/`db_write` seconds breakdown from the same line (STAGE2_TIMING=1), peak RSS from the Container Apps Job's own metrics (not something the app logs itself).
 
-5. **Revert step 2's bicep changes and redeploy again** — leaving a one-off `args` override or `STAGE2_TIMING=1` in place would silently change every future scheduled run, including the real monthly ingest.
+  5. **Revert step 2's bicep changes and redeploy again** — leaving a one-off `args` override or `STAGE2_TIMING=1` in place would silently change every future scheduled run, including the real monthly ingest.
 
-6. **Regression snapshot AFTER** (force-refresh so every EIN is actually recomputed, not skipped by the resume check — the real job run from step 3 may already have done this if `--force-refresh-signals` was included in `args`), then diff:
-   ```powershell
-   python pipeline/scripts/snapshot_stage2_outputs.py --eins-file pilot_eins.txt --out after.json
-   diff before.json after.json   # expect no output
-   ```
+  6. **Regression snapshot AFTER** (force-refresh so every EIN is actually recomputed, not skipped by the resume check — the real job run from step 3 may already have done this if `--force-refresh-signals` was included in `args`), then diff:
+     ```powershell
+     python pipeline/scripts/snapshot_stage2_outputs.py --eins-file pilot_eins.txt --out after.json
+     diff before.json after.json   # expect no output
+     ```
 
-**Known, deliberate limitation**: `STAGE2_BATCH_COMMIT_EVERY_FILINGS=500` is a *count* threshold, not literally "every EIN boundary" — a true per-EIN commit would mean ~1 commit per 2 filings (average filings/EIN), defeating the point of batching. A signal is only ever added to the same in-memory batch as the filings rows it was computed from, and that whole batch commits together, either every 500 filings or in one final flush — the resumability invariant holds either way, but round-trip count drops close to 500x rather than ~2x.
+  **Known, deliberate limitation**: `STAGE2_BATCH_COMMIT_EVERY_FILINGS=500` is a *count* threshold, not literally "every EIN boundary" — a true per-EIN commit would mean ~1 commit per 2 filings (average filings/EIN), defeating the point of batching. A signal is only ever added to the same in-memory batch as the filings rows it was computed from, and that whole batch commits together, either every 500 filings or in one final flush — the resumability invariant holds either way, but round-trip count drops close to 500x rather than ~2x.
 
-**Still open regardless of the above**: if `STAGE2_TIMING`'s breakdown shows the Azure Files SMB mount's *read* latency (not the central-directory re-parse the handle cache targets) still dominates, the next lever is copying this run's needed archives to local ephemeral disk at job start (check the Container Apps Job's ephemeral storage limit first — not confirmed this session) rather than reading every member over SMB repeatedly. Not implemented.
+  **Still open regardless of the above**: if `STAGE2_TIMING`'s breakdown shows the Azure Files SMB mount's *read* latency (not the central-directory re-parse the handle cache targets) still dominates, the next lever is copying this run's needed archives to local ephemeral disk at job start (check the Container Apps Job's ephemeral storage limit first — not confirmed this session) rather than reading every member over SMB repeatedly. Not implemented.
 
-**G2.x + E2 — Dashboard + Enrichment**: both are built and live-verified against real data but still need Duan's actual browser review (see "In progress" above). Once both are accepted: deploy infra (Static Web Apps + Functions app registration, wheel-vendoring the `discovery` package into the Functions deploy payload), Duan's own check of the CSV export against Lauren's original POC file, a real `FULLENRICH_API_KEY` in `local.settings.json` to exercise one live Enrich click end-to-end, and the brief's own v2.4 changelog entry for the stale-status/confidence decisions this gate made.
+- [ ] **2. G1.5's open criterion met**: an end-to-end national run (Stage 1 → 2 → 3 scoring → publish) completes unattended in the Container Apps Job, with run counts recorded. Blocked on item 1 above — the full national run is the thing item 1's throughput/resumability work is for.
+
+- [ ] **3. Scoring spot-check**: Duan manually reviews the top ~25 plus ~25 random prospects for ICP fit; findings written up; only blocking scoring defects are fixed before launch. Not started.
+
+- [ ] **4. Dashboard + CSV export verified end to end** on the internal-QA tenant, including the columns Lauren originally asked for. Built and live-verified against raw HTTP (see "In progress" → G2.x above) but not yet through an actual browser click-through — that's what this item still needs.
+
+- [ ] **5. Minimal access control for ONE customer**: an unauthenticated caller cannot read any prospects, and `client_id` is derived from the authenticated principal, never caller-controlled. First deliver a short proposal with 2-3 mechanism options (for example Static Web Apps / App Service built-in auth with an allowlist) and tradeoffs; implement only after Duan approves. Not started — no proposal written yet.
+
+- [ ] **6. CI workflow with a Postgres service container** that runs the full suite including the integration tests. Not started; depends on item 1's integration tests existing first.
+
+- [ ] **7. Housekeeping**: repo made private, Postgres `AllowDevMachine` firewall rule removed or documented as intentional, minimal runbook (run a national refresh, onboard a customer by inserting an `icp_configs` row, export, rotate the Anthropic key, restore the DB) sized to the under-2-hours-a-month goal. Not started.
+
+- [ ] **8. Enrichment stays OFF for customer tenants in v1** (`enrichment_enabled` false) pending FullEnrich reseller terms; it remains enabled only on the internal-QA tenant. Payments are out of v1: the first customer is invoiced manually through Appadino.AI LLC. Already true today (see "Notes for cold-start" — `client_id=2`'s `enrichment_enabled` confirmed `false`) — this item is "keep it this way," not new work, unless/until the reconciliation below resolves.
+
+  **FullEnrich reseller-terms reconciliation needed** (§5.5). §5.5 documents reseller terms as "confirmed by Hugo on Sept 15, 2026." A Sept 18 follow-up call added detail: Hugo gave 5,042 free trial credits (valid 3 months), said the reseller program must be purchased to continue after that, and said the current $500/12,500-credit pack requires signing a contract — consistent with a real (if entry-tier) reseller path, not a bare self-serve account. However, reseller pricing tiers quoted this call (100k credits/$3k, or 750k/$2,250) don't obviously reconcile with the ~$4,000 reseller figure from an earlier conversation. Get one written line from Hugo confirming: does the $500/12,500-credit pack's contract constitute the Reseller Agreement referenced in §5.5, and how does it relate to the $4,000 figure? **Still unresolved even though E1 itself closed GO (see "Done" above)** — E1's go/no-go was scoped to the adoption-threshold metrics only; treat E1's spike data as internal validation only, not yet cleared for delivering results to ARCHITECT, until this is confirmed.
 
 ## Open questions / decisions awaiting Duan
 
