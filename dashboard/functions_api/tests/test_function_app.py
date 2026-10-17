@@ -29,6 +29,9 @@ SAMPLE_ROW = {
     "city": "PORTLAND",
     "state": "ME",
     "revenue_latest": Decimal(612345),
+    "filing_revenue_total": Decimal(598000),
+    "filing_mission_text": None,
+    "filing_program_text": None,
     "values_signals": {
         "leadership_composition": {
             "score": 70,
@@ -125,13 +128,17 @@ def test_prospect_row_to_csv_dict_matches_confirmed_column_set() -> None:
         "name": "SEXUAL ASSAULT RESPONSE SERVICES OF SOUTHERN MAINE",
         "city": "PORTLAND",
         "state": "ME",
+        "revenue": Decimal(598000),
         "gap_rank": Decimal("66.67"),
-        "criteria_met_count": 2,
-        "qualifies": False,
-        "assigned_trigger": "new_ed",
+        "alignment": "2/6",
+        "qualifies": "No",
+        "assigned_trigger": "New executive director",
         "trigger_angle": "first-100-days",
-        "dd_present": False,
+        "values_population_served": "",
+        "values_leadership": "needs human confirmation",
+        "dd_present": "No",
         "fundraising_spend_ratio": 0.0,
+        "website": "https://sarssm.org",
         "suppression_flag": "",
         "contact_name": "Erin K Flood",
         "contact_title": "Executive Director",
@@ -181,9 +188,9 @@ def test_prospect_row_to_csv_dict_null_suppression_flag_becomes_empty_string() -
 def test_prospect_row_to_csv_dict_handles_missing_score() -> None:
     row = dict(SAMPLE_ROW, alignment=None, capacity=None)
     csv_row = _prospect_row_to_csv_dict(row)
-    assert csv_row["criteria_met_count"] is None
-    assert csv_row["qualifies"] is None
-    assert csv_row["dd_present"] is None
+    assert csv_row["alignment"] == ""
+    assert csv_row["qualifies"] == ""
+    assert csv_row["dd_present"] == ""
     assert csv_row["fundraising_spend_ratio"] is None
 
 

@@ -33,6 +33,8 @@ from discovery.stages.enrich import (
     select_primary_officer,
     start_enrichment,
 )
+from discovery.stages.qa import _program_text_corpus, _quoted_text_matches_corpus
+from discovery.stages.score import ALIGNMENT_CRITERIA
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
@@ -61,33 +63,58 @@ ENRICH_POLL_INTERVAL_S = 3.0
 # same-process shortcut that avoids a round trip when it can.
 _PENDING_JOBS: dict[tuple[int, str], str | None] = {}
 
-CSV_FIELDNAMES = [
-    "ein",
-    "name",
-    "city",
-    "state",
-    "gap_rank",
-    "criteria_met_count",
-    "qualifies",
-    "assigned_trigger",
-    "trigger_angle",
-    "dd_present",
-    "fundraising_spend_ratio",
-    "suppression_flag",
-    "contact_name",
-    "contact_title",
-    "contact_email",
-    "contact_phone",
-    "contact_status",
-]
+# Total alignment criteria in the active framework (currently 6 — criterion 2 is
+# excluded pending confirmation, see score.py), used as the "n/6" denominator.
+ALIGNMENT_CRITERIA_TOTAL = len(ALIGNMENT_CRITERIA)
 
-PROSPECT_QUERY = """
+LEADERSHIP_NEEDS_CONFIRMATION = "needs human confirmation"
+
+# Customer-facing labels for triggers.TRIGGER_PRIORITY codes (CSV only; the
+# dashboard and the stored prospects.assigned_trigger keep the codes).
+TRIGGER_LABELS: dict[str, str] = {
+    "new_ed": "New executive director",
+    "dd_departure": "Development director departed",
+    "transformational_revenue_jump": "Major revenue increase",
+    "first_filing_above_floor": "First filing above revenue floor",
+}
+
+# (internal key, customer-facing header), in export order. Internal keys are what
+# _prospect_row_to_csv_dict returns; only the header row uses the plain-English names.
+CSV_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("ein", "EIN"),
+    ("name", "Organization"),
+    ("city", "City"),
+    ("state", "State"),
+    ("revenue", "Revenue (most recent 990)"),
+    ("gap_rank", "Gap rank"),
+    ("alignment", f"Alignment (n/{ALIGNMENT_CRITERIA_TOTAL})"),
+    ("qualifies", "Qualifies"),
+    ("assigned_trigger", "Trigger"),
+    ("trigger_angle", "Trigger angle"),
+    ("values_population_served", "Values: Population served"),
+    ("values_leadership", "Values: Leadership"),
+    ("dd_present", "Development director present"),
+    ("fundraising_spend_ratio", "Fundraising spend ratio"),
+    ("website", "Website"),
+    ("suppression_flag", "Suppression flag"),
+    ("contact_name", "Contact name"),
+    ("contact_title", "Contact title"),
+    ("contact_email", "Contact email"),
+    ("contact_phone", "Contact phone"),
+    ("contact_status", "Contact status"),
+)
+CSV_FIELDNAMES = [key for key, _ in CSV_COLUMNS]
+CSV_HEADERS = [header for _, header in CSV_COLUMNS]
+
+# Shared by the dashboard list (PROSPECT_QUERY) and the CSV export (EXPORT_QUERY).
+# {extra_select}/{extra_join} are empty for the list, so it never loads 990 text.
+_PROSPECT_QUERY_TEMPLATE = """
     SELECT
         p.id, p.ein, p.client_id, p.status, p.assigned_trigger, p.trigger_angle,
         p.trigger_evidence, p.gap_rank, p.suppression_flag, p.notes, p.updated_by, p.updated_at,
         o.name AS org_name, o.city, o.state, o.revenue_latest, o.website,
         s.values_signals, s.alignment, s.capacity, s.soft_flags, s.disqualified, s.dq_reason,
-        f.officers, ic.config AS icp_config,
+        f.officers, ic.config AS icp_config,{extra_select}
         e.id AS enr_id, e.contact_name AS enr_contact_name, e.contact_title AS enr_contact_title,
         e.email AS enr_email, e.email_status AS enr_email_status,
         e.stale_detail AS enr_stale_detail, e.phone AS enr_phone,
@@ -106,7 +133,7 @@ PROSPECT_QUERY = """
         SELECT officers FROM filings f2
         WHERE f2.ein = p.ein AND f2.officers IS NOT NULL
         ORDER BY tax_year DESC LIMIT 1
-    ) f ON true
+    ) f ON true{extra_join}
     LEFT JOIN LATERAL (
         SELECT config FROM icp_configs ic2
         WHERE ic2.client_id = p.client_id AND ic2.active = true
@@ -122,6 +149,23 @@ PROSPECT_QUERY = """
     WHERE p.client_id = %(client_id)s
     ORDER BY p.gap_rank DESC NULLS LAST
 """
+
+PROSPECT_QUERY = _PROSPECT_QUERY_TEMPLATE.format(extra_select="", extra_join="")
+
+# Export-only: revenue plus the 990 text the quoted-values columns are re-verified
+# against (see _grounded_citation). Same "current filing" publish.load_filing_pair
+# (and so trigger detection) uses.
+EXPORT_QUERY = _PROSPECT_QUERY_TEMPLATE.format(
+    extra_select="""
+        rf.revenue_total AS filing_revenue_total,
+        rf.mission_text AS filing_mission_text, rf.program_text AS filing_program_text,""",
+    extra_join="""
+    LEFT JOIN LATERAL (
+        SELECT revenue_total, mission_text, program_text FROM filings f3
+        WHERE f3.ein = p.ein AND f3.extracted_at IS NOT NULL
+        ORDER BY tax_year DESC LIMIT 1
+    ) rf ON true""",
+)
 
 # Lighter-weight fetch for the enrich routes — only what's needed to run the guard
 # (hard rule 8, §9) and build a candidate, not the full review-table payload.
@@ -684,6 +728,47 @@ def delete_suppression(req: func.HttpRequest) -> func.HttpResponse:
     return _json_response({"id": suppression_id, "status": "deleted"})
 
 
+def _grounded_citation(values_signals: dict[str, Any] | None, key: str, corpus: str) -> str | None:
+    """The stored citation for one values signal, only when it's grounded: a non-null
+    score not flagged needs_human_verification, AND the quoted text re-verified here
+    against the org's own stored 990 mission/program text (same longest-common-
+    substring check score.enforce_hard_rules applies at scoring time). The re-check
+    is deliberate, not redundant: rows scored before that grounding check existed
+    (2026-09-18) carry needs_human_verification=false without ever having been
+    verified, and a customer-facing "quoted" cell must not show an unverified quote.
+    A bare field pointer (e.g. "govt_pct 0.59") isn't a quote and so stays blank.
+    Anything else returns None — never a paraphrase or a fallback."""
+    signal = (values_signals or {}).get(key)
+    if not isinstance(signal, dict):
+        return None
+    citation = signal.get("citation")
+    if signal.get("score") is None or signal.get("needs_human_verification"):
+        return None
+    if not isinstance(citation, str) or not citation.strip():
+        return None
+    if not _quoted_text_matches_corpus(citation, corpus):
+        return None
+    return citation
+
+
+def _yes_no(value: Any) -> Any:
+    """True/False -> Yes/No for customer-facing cells; None stays blank. Anything
+    else passes through unchanged rather than being coerced into a yes/no claim."""
+    if value is True:
+        return "Yes"
+    if value is False:
+        return "No"
+    return "" if value is None else value
+
+
+def _trigger_label(code: str | None) -> str:
+    """Unknown codes (e.g. a trigger type added to triggers.py before this mapping)
+    pass through as-is rather than erroring or being blanked."""
+    if not code:
+        return ""
+    return TRIGGER_LABELS.get(code, code)
+
+
 def _prospect_row_to_csv_dict(row: dict[str, Any]) -> dict[str, Any]:
     alignment = row["alignment"] or {}
     capacity = row["capacity"] or {}
@@ -716,18 +801,29 @@ def _prospect_row_to_csv_dict(row: dict[str, Any]) -> dict[str, Any]:
         if contact["retention_expired"]:
             contact_status = f"{contact_status} (expired)".strip()
 
+    criteria_met_count = alignment.get("criteria_met_count")
+    corpus = f"{row['filing_mission_text'] or ''} {_program_text_corpus(row['filing_program_text'])}"
+    leadership_citation = _grounded_citation(row["values_signals"], "leadership_composition", corpus)
+
     return {
         "ein": row["ein"],
         "name": row["org_name"],
         "city": row["city"],
         "state": row["state"],
+        "revenue": row["filing_revenue_total"],
         "gap_rank": row["gap_rank"],
-        "criteria_met_count": alignment.get("criteria_met_count"),
-        "qualifies": alignment.get("qualifies"),
-        "assigned_trigger": row["assigned_trigger"],
+        "alignment": (
+            f"{criteria_met_count}/{ALIGNMENT_CRITERIA_TOTAL}" if isinstance(criteria_met_count, int) else ""
+        ),
+        "qualifies": _yes_no(alignment.get("qualifies")),
+        "assigned_trigger": _trigger_label(row["assigned_trigger"]),
         "trigger_angle": row["trigger_angle"],
-        "dd_present": capacity.get("dd_present"),
+        "values_population_served": _grounded_citation(row["values_signals"], "population_served", corpus)
+        or "",
+        "values_leadership": leadership_citation or LEADERSHIP_NEEDS_CONFIRMATION,
+        "dd_present": _yes_no(capacity.get("dd_present")),
         "fundraising_spend_ratio": capacity.get("fundraising_spend_ratio"),
+        "website": row["website"] or "",
         "suppression_flag": row["suppression_flag"] or "",
         "contact_name": contact["name"] or "",
         "contact_title": contact["title"] or "",
@@ -737,6 +833,15 @@ def _prospect_row_to_csv_dict(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _render_csv(rows: list[dict[str, Any]]) -> str:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=CSV_FIELDNAMES)
+    writer.writerow(dict(zip(CSV_FIELDNAMES, CSV_HEADERS, strict=True)))
+    for row in rows:
+        writer.writerow(_prospect_row_to_csv_dict(row))
+    return buffer.getvalue()
+
+
 @app.route(route="export.csv", methods=["GET"])
 def export_csv(req: func.HttpRequest) -> func.HttpResponse:
     client_id = req.params.get("client_id")
@@ -744,17 +849,11 @@ def export_csv(req: func.HttpRequest) -> func.HttpResponse:
         return _error("client_id is required")
 
     with _conn() as conn, conn.cursor() as cur:
-        cur.execute(PROSPECT_QUERY, {"client_id": client_id})
+        cur.execute(EXPORT_QUERY, {"client_id": client_id})
         rows = cur.fetchall()
 
-    buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=CSV_FIELDNAMES)
-    writer.writeheader()
-    for row in rows:
-        writer.writerow(_prospect_row_to_csv_dict(row))
-
     return func.HttpResponse(
-        buffer.getvalue(),
+        _render_csv(rows),
         status_code=200,
         mimetype="text/csv",
         headers={"Content-Disposition": f"attachment; filename=prospects_client{client_id}.csv"},
