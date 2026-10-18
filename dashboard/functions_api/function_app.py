@@ -154,7 +154,7 @@ _PROSPECT_QUERY_TEMPLATE = """
         ORDER BY requested_at DESC LIMIT 1
     ) e ON true
     WHERE p.client_id = %(client_id)s
-    ORDER BY p.gap_rank DESC NULLS LAST
+    ORDER BY p.gap_rank DESC NULLS LAST, p.id ASC
 """
 
 PROSPECT_QUERY = _PROSPECT_QUERY_TEMPLATE.format(extra_select="", extra_join="")

@@ -506,3 +506,20 @@ def test_citation_spanning_mission_and_program_text_boundary_is_word_aligned(
     )
     _, rows = _export(monkeypatch, [row])
     assert rows[0]["Values: Population served"] == ""
+
+
+STABLE_ORDER_BY = "ORDER BY p.gap_rank DESC NULLS LAST, p.id ASC"
+
+
+@pytest.mark.parametrize("query_name", ["PROSPECT_QUERY", "EXPORT_QUERY"])
+def test_prospect_queries_end_with_deterministic_tie_break(query_name: str) -> None:
+    """Many prospects tie on gap_rank (e.g. 13 at 66.67 for client_id=2); without the
+    p.id tie-break their order is undefined and a reviewed row could jump position
+    after an UPDATE + reload. p.id is the prospects primary key, so this is total."""
+    sql = {"PROSPECT_QUERY": PROSPECT_QUERY, "EXPORT_QUERY": EXPORT_QUERY}[query_name]
+    assert sql.rstrip().endswith(STABLE_ORDER_BY)
+    order_clauses = [line.strip() for line in sql.splitlines() if line.strip().startswith("ORDER BY p.")]
+    assert order_clauses == [STABLE_ORDER_BY]
+    # The old gap_rank-only ordering must not survive anywhere in the query.
+    assert "ORDER BY p.gap_rank DESC NULLS LAST\n" not in sql
+    assert not sql.rstrip().endswith("ORDER BY p.gap_rank DESC NULLS LAST")
