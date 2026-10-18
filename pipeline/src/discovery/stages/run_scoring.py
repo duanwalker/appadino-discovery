@@ -114,12 +114,24 @@ def run_scoring(
     eins: list[str],
     database_url: str | None = None,
     haiku_cut_n: int | None = None,
+    eins_overridden: bool = False,
 ) -> dict[str, Any]:
+    """`eins_overridden=True` means `eins` came from `score --eins` instead of
+    select_survivor_eins — recorded in runs.counts (same key as filter's override) and
+    logged, so a bounded run never looks like an ordinary one in the `runs` table."""
     database_url = database_url or os.environ["DATABASE_URL"]
     anthropic_client = anthropic.Anthropic()
 
     started_at = datetime.now(UTC)
-    counts: dict[str, Any] = {}
+    # Recorded before any work so the override is visible even on a failed run.
+    counts: dict[str, Any] = {"eins_overridden": eins_overridden, "eins_requested": len(eins)}
+    if eins_overridden:
+        logger.warning(
+            "OVERRIDE (--eins): select_survivor_eins bypassed for client_id=%s — scoring %d "
+            "explicitly-provided EINs instead of the client's survivor set",
+            client_id,
+            len(eins),
+        )
     status = "success"
     error: str | None = None
     run_id: int | None = None

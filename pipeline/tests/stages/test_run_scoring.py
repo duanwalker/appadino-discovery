@@ -14,6 +14,9 @@ from __future__ import annotations
 
 from typing import Any, Self
 
+import pytest
+
+from discovery.stages import run_scoring as run_scoring_module
 from discovery.stages.run_scoring import _load_scoreable_orgs
 
 
@@ -113,3 +116,72 @@ def test_ein_with_no_signals_row_is_excluded_from_scoreable_orgs() -> None:
     assert orgs["111111111"]["revenue_total"] == 750_000
 
     assert "222222222" not in orgs
+
+
+# --- runs.counts records the `score --eins` override (no network, no DB) ---
+
+class _RunsCursor:
+    def __init__(self, log: list[tuple[str, Any]]) -> None:
+        self.log = log
+
+    def execute(self, sql: str, params: Any = None) -> None:
+        self.log.append((sql, params))
+
+    def fetchone(self) -> tuple[Any, ...]:
+        return (1,)  # runs.id for the INSERT ... RETURNING, icp version for the SELECT
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+class _RunsConn:
+    def __init__(self, log: list[tuple[str, Any]]) -> None:
+        self.log = log
+
+    def cursor(self) -> _RunsCursor:
+        return _RunsCursor(self.log)
+
+    def commit(self) -> None:
+        return None
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def _run_scoring_offline(monkeypatch: pytest.MonkeyPatch, eins: list[str], **kwargs: Any) -> dict[str, Any]:
+    """Runs the real run_scoring with every external boundary replaced: no Anthropic
+    client, no batch submission, no database. Returns the counts persisted to runs."""
+    log: list[tuple[str, Any]] = []
+    monkeypatch.setattr("psycopg.connect", lambda url: _RunsConn(log))
+    monkeypatch.setattr("anthropic.Anthropic", lambda: object())
+    monkeypatch.setattr(run_scoring_module, "get_active_icp_config", lambda conn, client_id: {})
+    monkeypatch.setattr(run_scoring_module, "_load_scoreable_orgs", lambda conn, eins: {})
+
+    def no_batches(client: object, requests: list[Any]) -> dict[str, Any]:
+        assert requests == []  # nothing scoreable, so nothing may be submitted
+        return {}
+
+    monkeypatch.setattr(run_scoring_module, "run_batch", no_batches)
+    returned = run_scoring_module.run_scoring(3, eins, database_url="postgresql://offline", **kwargs)
+    update = next(params for sql, params in log if sql.startswith("UPDATE runs SET"))
+    persisted = update[2].obj  # psycopg Json wrapper around the counts dict
+    assert persisted == returned
+    return returned
+
+
+def test_run_scoring_records_eins_override_in_runs_counts(monkeypatch: pytest.MonkeyPatch) -> None:
+    counts = _run_scoring_offline(monkeypatch, ["010343943", "010322532"], eins_overridden=True)
+    assert counts["eins_overridden"] is True
+    assert counts["eins_requested"] == 2
+
+
+def test_run_scoring_default_records_no_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    counts = _run_scoring_offline(monkeypatch, ["111111111"])
+    assert counts["eins_overridden"] is False
+    assert counts["eins_requested"] == 1
