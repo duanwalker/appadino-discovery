@@ -39,3 +39,7 @@ main.json
 .idea/
 .DS_Store
 Thumbs.db
+
+# Gate review artifacts (local working files, never committed)
+gate*.patch
+gate-report-*.md

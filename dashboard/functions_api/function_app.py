@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -33,7 +34,7 @@ from discovery.stages.enrich import (
     select_primary_officer,
     start_enrichment,
 )
-from discovery.stages.qa import _program_text_corpus, _quoted_text_matches_corpus
+from discovery.stages.qa import _normalize_for_match, _program_text_corpus
 from discovery.stages.score import ALIGNMENT_CRITERIA
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
@@ -68,6 +69,12 @@ _PENDING_JOBS: dict[tuple[int, str], str | None] = {}
 ALIGNMENT_CRITERIA_TOTAL = len(ALIGNMENT_CRITERIA)
 
 LEADERSHIP_NEEDS_CONFIRMATION = "needs human confirmation"
+
+CSV_BOM = "﻿"
+# Leading characters a spreadsheet treats as the start of a formula (OWASP CSV injection).
+FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+# Digits, +, spaces, parentheses, dashes, dots only, with at least one digit.
+PHONE_NUMBER_PATTERN = re.compile(r"[0-9+ ().\-]*[0-9][0-9+ ().\-]*")
 
 # Customer-facing labels for triggers.TRIGGER_PRIORITY codes (CSV only; the
 # dashboard and the stored prospects.assigned_trigger keep the codes).
@@ -730,14 +737,18 @@ def delete_suppression(req: func.HttpRequest) -> func.HttpResponse:
 
 def _grounded_citation(values_signals: dict[str, Any] | None, key: str, corpus: str) -> str | None:
     """The stored citation for one values signal, only when it's grounded: a non-null
-    score not flagged needs_human_verification, AND the quoted text re-verified here
-    against the org's own stored 990 mission/program text (same longest-common-
-    substring check score.enforce_hard_rules applies at scoring time). The re-check
-    is deliberate, not redundant: rows scored before that grounding check existed
-    (2026-09-18) carry needs_human_verification=false without ever having been
-    verified, and a customer-facing "quoted" cell must not show an unverified quote.
-    A bare field pointer (e.g. "govt_pct 0.59") isn't a quote and so stays blank.
-    Anything else returns None — never a paraphrase or a fallback."""
+    score not flagged needs_human_verification, AND the whole citation, after qa's
+    normalization (lower-case, punctuation/whitespace collapsed), appears verbatim in
+    the org's own stored 990 mission/program text.
+
+    Deliberately stricter than score.enforce_hard_rules' scoring-time check
+    (qa._quoted_text_matches_corpus), which accepts any 25-character overlap and so
+    passes a real opening with an invented tail. A customer-facing "quoted" cell must
+    be a quote, so this export requires the full citation. Consequences, all failing
+    safe to blank: quotes with "..." elisions, paraphrases, bare field pointers (e.g.
+    "govt_pct 0.59"), and non-Latin text (the normalizer strips it to nothing) are
+    not shown. The re-check is also why rows scored before the grounding check
+    existed (2026-09-18) can't show an unverified quote. Never a fallback."""
     signal = (values_signals or {}).get(key)
     if not isinstance(signal, dict):
         return None
@@ -746,7 +757,8 @@ def _grounded_citation(values_signals: dict[str, Any] | None, key: str, corpus: 
         return None
     if not isinstance(citation, str) or not citation.strip():
         return None
-    if not _quoted_text_matches_corpus(citation, corpus):
+    normalized_citation = _normalize_for_match(citation)
+    if not normalized_citation or normalized_citation not in _normalize_for_match(corpus):
         return None
     return citation
 
@@ -759,6 +771,37 @@ def _yes_no(value: Any) -> Any:
     if value is False:
         return "No"
     return "" if value is None else value
+
+
+def _alignment_cell(criteria_met_count: Any) -> str:
+    """"n/6" only for a count that's actually possible; a bool, string, or a value
+    outside 0..ALIGNMENT_CRITERIA_TOTAL (a data bug upstream) renders blank rather
+    than publishing an impossible "7/6"."""
+    if (
+        isinstance(criteria_met_count, int)
+        and not isinstance(criteria_met_count, bool)
+        and 0 <= criteria_met_count <= ALIGNMENT_CRITERIA_TOTAL
+    ):
+        return f"{criteria_met_count}/{ALIGNMENT_CRITERIA_TOTAL}"
+    return ""
+
+
+def _neutralize_formula_cells(cells: dict[str, Any]) -> dict[str, Any]:
+    """CSV/formula injection guard, applied once to every exported row. A text cell
+    starting with = + - @ tab or CR is prefixed with a single quote so a spreadsheet
+    shows it as text instead of evaluating it. Only str cells are touched, so the
+    numeric columns (Revenue, Gap rank, Fundraising spend ratio — Decimal/float from
+    the DB) are written as-is, negative numbers included. The one exemption is a
+    Contact phone value made only of phone characters (e.g. "+1 207-671-2868"): it
+    has no letters, so it can't name a function or DDE command."""
+    neutralized = dict(cells)
+    for key, value in cells.items():
+        if not isinstance(value, str) or not value.startswith(FORMULA_PREFIXES):
+            continue
+        if key == "contact_phone" and PHONE_NUMBER_PATTERN.fullmatch(value):
+            continue
+        neutralized[key] = "'" + value
+    return neutralized
 
 
 def _trigger_label(code: str | None) -> str:
@@ -801,20 +844,17 @@ def _prospect_row_to_csv_dict(row: dict[str, Any]) -> dict[str, Any]:
         if contact["retention_expired"]:
             contact_status = f"{contact_status} (expired)".strip()
 
-    criteria_met_count = alignment.get("criteria_met_count")
-    corpus = f"{row['filing_mission_text'] or ''} {_program_text_corpus(row['filing_program_text'])}"
+    corpus =f"{row['filing_mission_text'] or ''} {_program_text_corpus(row['filing_program_text'])}"
     leadership_citation = _grounded_citation(row["values_signals"], "leadership_composition", corpus)
 
-    return {
+    return _neutralize_formula_cells({
         "ein": row["ein"],
         "name": row["org_name"],
         "city": row["city"],
         "state": row["state"],
         "revenue": row["filing_revenue_total"],
         "gap_rank": row["gap_rank"],
-        "alignment": (
-            f"{criteria_met_count}/{ALIGNMENT_CRITERIA_TOTAL}" if isinstance(criteria_met_count, int) else ""
-        ),
+        "alignment": _alignment_cell(alignment.get("criteria_met_count")),
         "qualifies": _yes_no(alignment.get("qualifies")),
         "assigned_trigger": _trigger_label(row["assigned_trigger"]),
         "trigger_angle": row["trigger_angle"],
@@ -830,7 +870,7 @@ def _prospect_row_to_csv_dict(row: dict[str, Any]) -> dict[str, Any]:
         "contact_email": contact_email,
         "contact_phone": contact_phone,
         "contact_status": contact_status,
-    }
+    })
 
 
 def _render_csv(rows: list[dict[str, Any]]) -> str:
@@ -853,9 +893,11 @@ def export_csv(req: func.HttpRequest) -> func.HttpResponse:
         rows = cur.fetchall()
 
     return func.HttpResponse(
-        _render_csv(rows),
+        # BOM so Excel detects UTF-8 instead of mis-decoding accented/non-Latin text.
+        CSV_BOM + _render_csv(rows),
         status_code=200,
         mimetype="text/csv",
+        charset="utf-8",
         headers={"Content-Disposition": f"attachment; filename=prospects_client{client_id}.csv"},
     )
 

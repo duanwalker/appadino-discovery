@@ -5,6 +5,7 @@ downloads, not just the intermediate dict."""
 
 from __future__ import annotations
 
+import codecs
 import csv
 import io
 from decimal import Decimal
@@ -90,7 +91,7 @@ def _export(monkeypatch: pytest.MonkeyPatch, rows: list[dict[str, Any]]) -> tupl
         func.HttpRequest(method="GET", url="/api/export.csv", params={"client_id": "2"}, body=b"")
     )
     assert response.status_code == 200
-    text = response.get_body().decode("utf-8")
+    text = response.get_body().decode("utf-8-sig")
     return text, list(csv.DictReader(io.StringIO(text)))
 
 
@@ -334,3 +335,123 @@ def test_export_query_loads_990_text_and_revenue(monkeypatch: pytest.MonkeyPatch
     for marker in _FILING_TEXT_MARKERS:
         assert marker in sql, marker
     assert "rf.revenue_total AS filing_revenue_total" in sql
+
+
+def test_response_starts_with_a_single_utf8_bom(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("function_app._conn", lambda: _Connection([_row()]))
+    response = export_csv(
+        func.HttpRequest(method="GET", url="/api/export.csv", params={"client_id": "2"}, body=b"")
+    )
+    body = response.get_body()
+    assert body.startswith(codecs.BOM_UTF8)
+    assert body.count(codecs.BOM_UTF8) == 1
+    assert response.charset.lower() == "utf-8"
+    # Header row right after the BOM, so Excel shows "EIN" (not "﻿EIN") as the first header.
+    assert body[len(codecs.BOM_UTF8) :].startswith(b"EIN,Organization,")
+
+
+@pytest.mark.parametrize(
+    "prefix", ["=", "+", "-", "@", "\t", "\r"], ids=["equals", "plus", "minus", "at", "tab", "cr"]
+)
+def test_each_formula_prefix_gets_a_single_quote(monkeypatch: pytest.MonkeyPatch, prefix: str) -> None:
+    payload = f"{prefix}HYPERLINK(\"http://evil.example\",\"x\")"
+    _, rows = _export(monkeypatch, [_row(org_name=payload, website=payload)])
+    assert rows[0]["Organization"] == "'" + payload
+    assert rows[0]["Website"] == "'" + payload
+
+
+def test_plain_text_cells_are_not_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, rows = _export(monkeypatch, [_row(org_name="Day One", website="https://dayoneme.org")])
+    assert rows[0]["Organization"] == "Day One"
+    assert rows[0]["Website"] == "https://dayoneme.org"
+
+
+@pytest.mark.parametrize("phone", ["+1 207-671-2868", "+1 (207) 671.2868", "207-671-2868", "-2076712868"])
+def test_phone_number_starting_with_plus_or_dash_is_exempt(monkeypatch: pytest.MonkeyPatch, phone: str) -> None:
+    _, rows = _export(monkeypatch, [_row(enr_id=7, enr_email="a@b.org", enr_email_status="verified", enr_phone=phone)])
+    assert rows[0]["Contact phone"] == phone
+
+
+@pytest.mark.parametrize("phone", ["+1 207 =cmd", "+SUM(1,2)", "+1\t207", "++", "-"])
+def test_phone_cell_that_is_not_strictly_a_phone_number_is_neutralized(
+    monkeypatch: pytest.MonkeyPatch, phone: str
+) -> None:
+    _, rows = _export(monkeypatch, [_row(enr_id=7, enr_email="a@b.org", enr_email_status="verified", enr_phone=phone)])
+    assert rows[0]["Contact phone"] == "'" + phone
+
+
+def test_phone_exemption_applies_only_to_the_phone_column(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, rows = _export(monkeypatch, [_row(org_name="+1 207-671-2868")])
+    assert rows[0]["Organization"] == "'+1 207-671-2868"
+
+
+def test_negative_numbers_are_not_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
+    row = _row(
+        filing_revenue_total=Decimal("-48210.00"),
+        gap_rank=Decimal("-1.5"),
+        capacity={"dd_present": False, "fundraising_spend_ratio": -0.02},
+    )
+    _, rows = _export(monkeypatch, [row])
+    assert rows[0]["Revenue (most recent 990)"] == "-48210.00"
+    assert rows[0]["Gap rank"] == "-1.5"
+    assert rows[0]["Fundraising spend ratio"] == "-0.02"
+
+
+def test_grounded_citation_starting_with_formula_char_is_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
+    citation = "-Serves 1,100 Maine children whose families face hardship"
+    signals = {
+        "population_served": {"score": 80, "rationale": "r", "citation": citation, "needs_human_verification": False},
+        "leadership_composition": {
+            "score": 70,
+            "rationale": "r",
+            "citation": "@Our board is women-led by design",
+            "needs_human_verification": False,
+        },
+    }
+    row = _row(
+        values_signals=signals,
+        filing_mission_text="Serves 1,100 Maine children whose families face hardship. Our board is women-led by design.",
+    )
+    text, rows = _export(monkeypatch, [row])
+    assert rows[0]["Values: Population served"] == "'" + citation
+    assert rows[0]["Values: Leadership"] == "'@Our board is women-led by design"
+    # Still a single, correctly escaped CSV field (the citation contains commas).
+    assert f'"\'{citation}"' in text
+
+
+@pytest.mark.parametrize(
+    "count,expected",
+    [(0, "0/6"), (6, "6/6"), (7, ""), (-1, ""), (100, ""), (True, ""), (2.0, ""), ("3", "")],
+    ids=["zero", "max", "seven", "negative", "huge", "bool", "float", "string"],
+)
+def test_alignment_out_of_range_or_wrong_type_is_blank(
+    monkeypatch: pytest.MonkeyPatch, count: Any, expected: str
+) -> None:
+    _, rows = _export(monkeypatch, [_row(alignment={"criteria_met_count": count, "qualifies": False})])
+    assert rows[0]["Alignment (n/6)"] == expected
+
+
+def test_quote_with_invented_tail_is_not_exported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shared scoring check accepts any 25-character overlap; the export requires
+    the whole normalized citation to be present in the 990 text."""
+    real = "Provides after-school tutoring to children in Lewiston"
+    signals = {
+        "population_served": {
+            "score": 85,
+            "rationale": "r",
+            "citation": real + " and guarantees every family a $10,000 grant",
+            "needs_human_verification": False,
+        },
+    }
+    row = _row(values_signals=signals, filing_mission_text=real + ".")
+    _, rows = _export(monkeypatch, [row])
+    assert rows[0]["Values: Population served"] == ""
+
+
+def test_short_citation_fully_present_is_grounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    signals = {
+        "population_served": {"score": 85, "rationale": "r", "citation": "rural veterans", "needs_human_verification": False},
+    }
+    row = _row(values_signals=signals, filing_mission_text="We serve rural veterans in Aroostook County.")
+    _, rows = _export(monkeypatch, [row])
+    assert rows[0]["Values: Population served"] == "rural veterans"
