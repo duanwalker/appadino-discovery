@@ -455,3 +455,54 @@ def test_short_citation_fully_present_is_grounded(monkeypatch: pytest.MonkeyPatc
     row = _row(values_signals=signals, filing_mission_text="We serve rural veterans in Aroostook County.")
     _, rows = _export(monkeypatch, [row])
     assert rows[0]["Values: Population served"] == "rural veterans"
+
+
+def _population_cell(monkeypatch: pytest.MonkeyPatch, citation: str, mission: str) -> str:
+    signals = {
+        "population_served": {"score": 85, "rationale": "r", "citation": citation, "needs_human_verification": False},
+    }
+    _, rows = _export(monkeypatch, [_row(values_signals=signals, filing_mission_text=mission)])
+    return rows[0]["Values: Population served"]
+
+
+@pytest.mark.parametrize(
+    "citation,mission",
+    [("men", "Shelter and counseling for women"), ("art", "A neighborhood block party every summer")],
+    ids=["men-inside-women", "art-inside-party"],
+)
+def test_citation_matching_only_inside_a_word_is_not_grounded(
+    monkeypatch: pytest.MonkeyPatch, citation: str, mission: str
+) -> None:
+    assert _population_cell(monkeypatch, citation, mission) == ""
+
+
+def test_whole_word_citation_is_grounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    mission = "Shelter and counseling for women and men leaving incarceration"
+    assert _population_cell(monkeypatch, "men leaving incarceration", mission) == "men leaving incarceration"
+
+
+@pytest.mark.parametrize(
+    "citation",
+    ["Shelter and counseling", "women and men leaving incarceration."],
+    ids=["very-start", "very-end"],
+)
+def test_citation_at_corpus_start_or_end_is_grounded(monkeypatch: pytest.MonkeyPatch, citation: str) -> None:
+    mission = "Shelter and counseling for women and men leaving incarceration."
+    assert _population_cell(monkeypatch, citation, mission) == citation
+
+
+def test_citation_spanning_mission_and_program_text_boundary_is_word_aligned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mission and program text are joined with a space, so the last mission word and
+    the first program word are separate words, not one glued token."""
+    signals = {
+        "population_served": {"score": 85, "rationale": "r", "citation": "elders", "needs_human_verification": False},
+    }
+    row = _row(
+        values_signals=signals,
+        filing_mission_text="Meals for elder",
+        filing_program_text=[{"desc": "s and their caregivers"}],
+    )
+    _, rows = _export(monkeypatch, [row])
+    assert rows[0]["Values: Population served"] == ""

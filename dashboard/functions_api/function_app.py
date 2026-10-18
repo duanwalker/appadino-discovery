@@ -70,7 +70,7 @@ ALIGNMENT_CRITERIA_TOTAL = len(ALIGNMENT_CRITERIA)
 
 LEADERSHIP_NEEDS_CONFIRMATION = "needs human confirmation"
 
-CSV_BOM = "﻿"
+CSV_BOM = "\ufeff"
 # Leading characters a spreadsheet treats as the start of a formula (OWASP CSV injection).
 FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 # Digits, +, spaces, parentheses, dashes, dots only, with at least one digit.
@@ -739,7 +739,7 @@ def _grounded_citation(values_signals: dict[str, Any] | None, key: str, corpus: 
     """The stored citation for one values signal, only when it's grounded: a non-null
     score not flagged needs_human_verification, AND the whole citation, after qa's
     normalization (lower-case, punctuation/whitespace collapsed), appears verbatim in
-    the org's own stored 990 mission/program text.
+    the org's own stored 990 mission/program text as whole words.
 
     Deliberately stricter than score.enforce_hard_rules' scoring-time check
     (qa._quoted_text_matches_corpus), which accepts any 25-character overlap and so
@@ -757,8 +757,14 @@ def _grounded_citation(values_signals: dict[str, Any] | None, key: str, corpus: 
         return None
     if not isinstance(citation, str) or not citation.strip():
         return None
+    # Whole words only: _normalize_for_match leaves just [a-z0-9] runs joined by single
+    # spaces (no leading/trailing space), so space-padding both sides turns substring
+    # into a word-aligned match — "men" no longer grounds inside "women", nor "art"
+    # inside "party", while a citation at the very start or end of the corpus still does.
     normalized_citation = _normalize_for_match(citation)
-    if not normalized_citation or normalized_citation not in _normalize_for_match(corpus):
+    if not normalized_citation:
+        return None
+    if f" {normalized_citation} " not in f" {_normalize_for_match(corpus)} ":
         return None
     return citation
 
@@ -774,7 +780,7 @@ def _yes_no(value: Any) -> Any:
 
 
 def _alignment_cell(criteria_met_count: Any) -> str:
-    """"n/6" only for a count that's actually possible; a bool, string, or a value
+    """Shows n/6 only for a count that's actually possible; a bool, string, or a value
     outside 0..ALIGNMENT_CRITERIA_TOTAL (a data bug upstream) renders blank rather
     than publishing an impossible "7/6"."""
     if (
@@ -844,10 +850,11 @@ def _prospect_row_to_csv_dict(row: dict[str, Any]) -> dict[str, Any]:
         if contact["retention_expired"]:
             contact_status = f"{contact_status} (expired)".strip()
 
-    corpus =f"{row['filing_mission_text'] or ''} {_program_text_corpus(row['filing_program_text'])}"
+    corpus = f"{row['filing_mission_text'] or ''} {_program_text_corpus(row['filing_program_text'])}"
+    population_citation = _grounded_citation(row["values_signals"], "population_served", corpus)
     leadership_citation = _grounded_citation(row["values_signals"], "leadership_composition", corpus)
 
-    return _neutralize_formula_cells({
+    cells = {
         "ein": row["ein"],
         "name": row["org_name"],
         "city": row["city"],
@@ -858,8 +865,7 @@ def _prospect_row_to_csv_dict(row: dict[str, Any]) -> dict[str, Any]:
         "qualifies": _yes_no(alignment.get("qualifies")),
         "assigned_trigger": _trigger_label(row["assigned_trigger"]),
         "trigger_angle": row["trigger_angle"],
-        "values_population_served": _grounded_citation(row["values_signals"], "population_served", corpus)
-        or "",
+        "values_population_served": population_citation or "",
         "values_leadership": leadership_citation or LEADERSHIP_NEEDS_CONFIRMATION,
         "dd_present": _yes_no(capacity.get("dd_present")),
         "fundraising_spend_ratio": capacity.get("fundraising_spend_ratio"),
@@ -870,7 +876,8 @@ def _prospect_row_to_csv_dict(row: dict[str, Any]) -> dict[str, Any]:
         "contact_email": contact_email,
         "contact_phone": contact_phone,
         "contact_status": contact_status,
-    })
+    }
+    return _neutralize_formula_cells(cells)
 
 
 def _render_csv(rows: list[dict[str, Any]]) -> str:
