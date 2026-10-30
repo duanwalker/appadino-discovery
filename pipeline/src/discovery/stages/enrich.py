@@ -7,11 +7,14 @@ same conventions, not because it participates in the publish pipeline.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
+
+import httpx
 
 from discovery.clients.enrichment_provider import (
     EnrichmentCandidate,
@@ -19,6 +22,8 @@ from discovery.clients.enrichment_provider import (
     EnrichmentResult,
     PollOutcome,
 )
+
+logger = logging.getLogger(__name__)
 
 RETENTION_DAYS = 90  # FullEnrich reseller terms (§5.5)
 
@@ -147,7 +152,21 @@ def start_enrichment(
         return EnrichAttempt(status="no_candidate", reason="no usable officer name or org domain on file")
 
     job_id = provider.submit(candidate)
-    return check_enrichment(provider, job_id, org_domain, poll_attempts=poll_attempts, poll_interval_s=poll_interval_s)
+    try:
+        return check_enrichment(
+            provider, job_id, org_domain, poll_attempts=poll_attempts, poll_interval_s=poll_interval_s
+        )
+    except httpx.HTTPStatusError as exc:
+        # The job exists at the provider once submit returns. Losing its id here would
+        # make the caller release the claim, and a retry would submit (and pay) twice;
+        # report it pending so the status route owns the poll failure instead.
+        logger.warning(
+            "enrichment %s submitted but status check failed: HTTP %s %s",
+            job_id,
+            exc.response.status_code,
+            exc.response.text[:500],
+        )
+        return EnrichAttempt(status="pending", job_id=job_id)
 
 
 def check_enrichment(

@@ -8,6 +8,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import httpx
+
 from discovery.clients import fullenrich
 from discovery.clients.enrichment_provider import (
     EnrichmentCandidate,
@@ -15,6 +17,7 @@ from discovery.clients.enrichment_provider import (
     PollOutcome,
     PollResult,
 )
+from discovery.clients.fullenrich import IN_PROGRESS_ERROR_CODE, error_code
 
 PROVIDER_NAME = "fullenrich"
 ENRICH_FIELDS = ["contact.work_emails", "contact.phones"]
@@ -133,6 +136,11 @@ def parse_contact_result(contact_result: dict[str, Any], org_domain: str | None)
     # — prefer FullEnrich's resolved LinkedIn profile name when it found one (E1).
     contact_name = profile.get("full_name")
 
+    # v2 Person schema has no top-level linkedin_url; the profile URL lives under
+    # social_profiles.professional_network (docs, re-checked 2026-10-29).
+    social_profiles = profile.get("social_profiles") or {}
+    professional_network = social_profiles.get("professional_network") or {}
+
     credits_spent = (1 if email else 0) + (10 if phone else 0)
 
     return EnrichmentResult(
@@ -142,7 +150,7 @@ def parse_contact_result(contact_result: dict[str, Any], org_domain: str | None)
         email_status=email_status if matched else "not_found",
         stale_detail=stale_detail,
         phone=phone,
-        linkedin_url=profile.get("linkedin_url"),
+        linkedin_url=professional_network.get("url"),
         provider_confidence=provider_confidence if matched else 0,
         credits_spent=credits_spent,
         raw=contact_result,
@@ -161,9 +169,11 @@ class FullEnrichProvider:
         self._subaccount_id = subaccount_id
 
     def submit(self, candidate: EnrichmentCandidate) -> str:
+        # v2 keys are snake_case (first_name/last_name), as E1's spike sent them.
+        # "firstname"/"lastname" are rejected: 400 error.enrichment.first_name.empty.
         contact = {
-            "firstname": candidate.first_name,
-            "lastname": candidate.last_name,
+            "first_name": candidate.first_name,
+            "last_name": candidate.last_name,
             "domain": candidate.domain,
             "enrich_fields": ENRICH_FIELDS,
             "custom": {"ein": candidate.ein},
@@ -172,7 +182,12 @@ class FullEnrichProvider:
         return fullenrich.start_bulk_enrichment(self._api_key, batch_name, [contact])
 
     def poll(self, job_id: str, org_domain: str | None) -> PollResult:
-        batch_result = fullenrich.get_bulk_enrichment(self._api_key, job_id)
+        try:
+            batch_result = fullenrich.get_bulk_enrichment(self._api_key, job_id)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 400 and error_code(exc.response) == IN_PROGRESS_ERROR_CODE:
+                return PollResult(outcome=PollOutcome.PENDING)
+            raise
         status = batch_result.get("status")
         if status not in fullenrich.TERMINAL_STATUSES:
             return PollResult(outcome=PollOutcome.PENDING)

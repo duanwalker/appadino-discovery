@@ -1,5 +1,8 @@
 from typing import ClassVar
 
+import httpx
+import pytest
+
 from discovery.clients import fullenrich_adapter
 from discovery.clients.enrichment_provider import EnrichmentCandidate, PollOutcome
 from discovery.clients.fullenrich_adapter import (
@@ -18,8 +21,17 @@ def _contact_result(email: str | None, fe_status: str | None, phone: str | None 
         contact_info["most_probable_phone"] = {"number": phone, "ownership_match_confidence": 88}
     result: dict = {"contact_info": contact_info}
     if full_name:
-        result["profile"] = {"full_name": full_name, "linkedin_url": "https://linkedin.com/in/x"}
+        result["profile"] = {
+            "full_name": full_name,
+            "social_profiles": {"professional_network": {"url": "https://linkedin.com/in/x"}},
+        }
     return result
+
+
+def _status_error(status_code: int, body: dict) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "https://app.fullenrich.com/api/v2/contact/enrich/bulk/job-123")
+    response = httpx.Response(status_code, json=body, request=request)
+    return httpx.HTTPStatusError("error", request=request, response=response)
 
 
 class TestDomainFromWebsite:
@@ -90,6 +102,16 @@ class TestParseContactResult:
         )
         assert result.contact_name == "Sarah Lundin"
 
+    def test_linkedin_url_read_from_v2_social_profiles(self) -> None:
+        result = parse_contact_result(
+            _contact_result("slundin@org.org", "DELIVERABLE", full_name="Sarah Lundin"), "org.org"
+        )
+        assert result.linkedin_url == "https://linkedin.com/in/x"
+
+    def test_no_profile_means_no_linkedin_url(self) -> None:
+        result = parse_contact_result(_contact_result("jsmith@org.org", "DELIVERABLE"), "org.org")
+        assert result.linkedin_url is None
+
 
 class _FakeFullEnrichModule:
     """Swapped in place of discovery.clients.fullenrich inside the adapter under
@@ -101,6 +123,7 @@ class _FakeFullEnrichModule:
         self.start_calls: list[tuple] = []
         self.get_calls: list[str] = []
         self.next_get_response: dict = {"status": "PENDING"}
+        self.next_get_error: Exception | None = None
 
     def start_bulk_enrichment(self, api_key, name, contacts, client=None):
         self.start_calls.append((api_key, name, contacts))
@@ -108,6 +131,8 @@ class _FakeFullEnrichModule:
 
     def get_bulk_enrichment(self, api_key, enrichment_id, client=None):
         self.get_calls.append(enrichment_id)
+        if self.next_get_error is not None:
+            raise self.next_get_error
         return self.next_get_response
 
 
@@ -125,8 +150,8 @@ class TestFullEnrichProvider:
         assert api_key == "key-1"
         assert contacts == [
             {
-                "firstname": "Jane",
-                "lastname": "Smith",
+                "first_name": "Jane",
+                "last_name": "Smith",
                 "domain": "org.org",
                 "enrich_fields": fullenrich_adapter.ENRICH_FIELDS,
                 "custom": {"ein": "123456789"},
@@ -142,6 +167,27 @@ class TestFullEnrichProvider:
         poll_result = provider.poll("job-123", "org.org")
 
         assert poll_result.outcome is PollOutcome.PENDING
+
+    def test_poll_in_progress_400_is_pending_not_failure(self, monkeypatch) -> None:
+        """Documented v2 behaviour: GET answers 400 error.enrichment.in_progress until
+        the batch is ready."""
+        fake = _FakeFullEnrichModule()
+        fake.next_get_error = _status_error(400, {"code": "error.enrichment.in_progress", "message": "not ready"})
+        monkeypatch.setattr(fullenrich_adapter, "fullenrich", fake)
+        provider = FullEnrichProvider(api_key="key-1")
+
+        poll_result = provider.poll("job-123", "org.org")
+
+        assert poll_result.outcome is PollOutcome.PENDING
+
+    def test_poll_other_errors_propagate(self, monkeypatch) -> None:
+        fake = _FakeFullEnrichModule()
+        fake.next_get_error = _status_error(404, {"code": "error.enrichment.not_found", "message": "nope"})
+        monkeypatch.setattr(fullenrich_adapter, "fullenrich", fake)
+        provider = FullEnrichProvider(api_key="key-1")
+
+        with pytest.raises(httpx.HTTPStatusError):
+            provider.poll("job-123", "org.org")
 
     def test_poll_done_with_match(self, monkeypatch) -> None:
         fake = _FakeFullEnrichModule()

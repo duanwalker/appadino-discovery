@@ -5,11 +5,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: { "Content-Type": "application/json", ...init?.headers },
   });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `${res.status} ${res.statusText}`);
+  // Read as text first: an unhandled server error can arrive with an empty body, and
+  // the message shown on the row should be short either way, not a JSON parse error.
+  const text = await res.text();
+  let body: unknown = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = null;
   }
-  return res.json() as Promise<T>;
+  if (!res.ok) {
+    const message = (body as { error?: unknown } | null)?.error;
+    throw new Error(typeof message === "string" && message ? message : `Request failed (HTTP ${res.status})`);
+  }
+  if (body === null) {
+    throw new Error(`Empty or unreadable response from the server (HTTP ${res.status})`);
+  }
+  return body as T;
 }
 
 // Internal dev tool, not customer-facing — see function_app.py's list_clients.
@@ -81,7 +93,8 @@ export interface EnrichContactResult {
 }
 
 export type EnrichResponse =
-  | { status: "pending"; job_id: string }
+  // job_id is absent while another request holds the claim but has no job id yet.
+  | { status: "pending"; job_id?: string }
   | { status: "done"; enrichment_id: number; contact: EnrichContactResult };
 
 // §5.5/E2: submit-then-poll, not synchronous (FullEnrich's real API, confirmed by

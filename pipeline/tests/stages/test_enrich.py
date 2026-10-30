@@ -1,5 +1,7 @@
 from datetime import UTC, datetime
 
+import httpx
+
 from discovery.clients.enrichment_provider import (
     EnrichmentCandidate,
     EnrichmentResult,
@@ -227,6 +229,29 @@ class TestStartEnrichment:
         assert attempt.status == "pending"
         assert attempt.job_id == "job-1"
         assert len(provider.poll_calls) == 2
+
+
+    def test_poll_failure_after_submit_keeps_job_id_as_pending(self) -> None:
+        """Once submit returns, the job exists (and is paid for) at the provider — a
+        failed status check must not lose its id, or the caller releases the claim
+        and the next click submits a second, separately billed job."""
+
+        class _PollRaises(_StubProvider):
+            def poll(self, job_id: str, org_domain: str | None) -> PollResult:
+                request = httpx.Request("GET", "https://example.invalid/bulk/job-1")
+                response = httpx.Response(429, json={"code": "error.rate.limit"}, request=request)
+                raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+
+        provider = _PollRaises()
+        officer = {"name": "Jane Smith", "title": "Executive Director"}
+        attempt = start_enrichment(
+            provider, "123", "org.org", officer,
+            status="approved", enrichment_enabled=True, fullenrich_subaccount_id="sub-1",
+            poll_attempts=2, poll_interval_s=0,
+        )
+        assert attempt.status == "pending"
+        assert attempt.job_id == "job-1"
+        assert len(provider.submit_calls) == 1
 
 
 class TestCheckEnrichment:

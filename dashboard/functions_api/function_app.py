@@ -21,7 +21,9 @@ from decimal import Decimal
 from typing import Any
 
 import azure.functions as func
+import httpx
 import psycopg
+from discovery.clients import fullenrich
 from discovery.clients.enrichment_provider import EnrichmentResult
 from discovery.clients.fullenrich_adapter import FullEnrichProvider, domain_from_website
 from discovery.db import get_database_url
@@ -500,6 +502,26 @@ def _clear_pending_slot(conn: psycopg.Connection[Any], client_id: int, ein: str)
     _PENDING_JOBS.pop((client_id, ein), None)
 
 
+def _provider_error(action: str, exc: httpx.HTTPStatusError) -> func.HttpResponse:
+    """FullEnrich rejected a call: a readable 502 instead of an unhandled 500 with an
+    empty body. Logs the status and a truncated response body only — never the
+    request, whose headers carry the API key."""
+    response = exc.response
+    code = fullenrich.error_code(response)
+    logger.warning(
+        "FullEnrich %s failed: HTTP %s %s", action, response.status_code, fullenrich.error_body_excerpt(response)
+    )
+    detail = f"HTTP {response.status_code}" + (f", {code}" if code else "")
+    return _json_response(
+        {
+            "error": f"FullEnrich rejected the {action} ({detail})",
+            "provider_status": response.status_code,
+            "provider_code": code,
+        },
+        502,
+    )
+
+
 def _respond_to_enrich_attempt(
     conn: psycopg.Connection[Any], client_id: int, ein: str, prospect_id: int, attempt: EnrichAttempt
 ) -> func.HttpResponse:
@@ -584,6 +606,11 @@ def enrich_prospect(req: func.HttpRequest) -> func.HttpResponse:
                 _set_claimed_job_id(conn, client_id, ein, attempt.job_id)
                 _PENDING_JOBS[cache_key] = attempt.job_id
             return _respond_to_enrich_attempt(conn, client_id, ein, row["id"], attempt)
+        except httpx.HTTPStatusError as exc:
+            # Only submit can raise this here (start_enrichment turns a post-submit
+            # poll failure into "pending"), so no job exists: release the claim.
+            _clear_pending_slot(conn, client_id, ein)
+            return _provider_error("enrichment request", exc)
         except Exception:
             # Never leave a claimed slot stuck on an unexpected error — a raised
             # exception here means no job is actually in flight, so the claim must
@@ -620,7 +647,16 @@ def enrich_status(req: func.HttpRequest) -> func.HttpResponse:
             return _error("FullEnrich API key not configured", 500)
 
         org_domain = domain_from_website(row["website"])
-        attempt = check_enrichment(provider, job_id, org_domain, poll_attempts=1, poll_interval_s=0)
+        try:
+            attempt = check_enrichment(provider, job_id, org_domain, poll_attempts=1, poll_interval_s=0)
+        except httpx.HTTPStatusError as exc:
+            # A 4xx other than 429 (unknown job, bad key, out of credits) means this
+            # job will never resolve: release the claim so the next click resubmits.
+            # 429/5xx are transient — keep it, so a retry resumes the same paid job.
+            status_code = exc.response.status_code
+            if 400 <= status_code < 500 and status_code != 429:
+                _clear_pending_slot(conn, row["client_id"], row["ein"])
+            return _provider_error("status check", exc)
         return _respond_to_enrich_attempt(conn, row["client_id"], row["ein"], row["id"], attempt)
 
 

@@ -7,8 +7,32 @@ import httpx
 
 BASE_URL = "https://app.fullenrich.com/api/v2"
 
-# Confirmed against https://docs.fullenrich.com/api/v2/contact/enrich/bulk/get (2026-09-19).
+# Confirmed against https://docs.fullenrich.com/api/v2/contact/enrich/bulk/get (2026-09-19,
+# re-checked 2026-10-29: non-terminal statuses are CREATED and IN_PROGRESS).
 TERMINAL_STATUSES = {"FINISHED", "CANCELED", "CREDITS_INSUFFICIENT", "RATE_LIMIT", "UNKNOWN"}
+
+# Documented 400 from GET /contact/enrich/bulk/{id} while the batch is still running
+# ("Enrichment not ready, try again in 30 seconds") — a not-yet-done, not a failure.
+IN_PROGRESS_ERROR_CODE = "error.enrichment.in_progress"
+
+ERROR_BODY_LOG_LIMIT = 500
+
+
+def error_code(response: httpx.Response) -> str | None:
+    """The `code` from FullEnrich's documented error body ({"code", "message"}), or
+    None when the body isn't that shape (e.g. the 402 result-shaped body)."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    code = body.get("code") if isinstance(body, dict) else None
+    return code if isinstance(code, str) else None
+
+
+def error_body_excerpt(response: httpx.Response) -> str:
+    """Response body only, truncated for logs. Never log the request: its headers
+    carry the API key."""
+    return response.text[:ERROR_BODY_LOG_LIMIT]
 
 
 def get_credits(api_key: str, client: httpx.Client | None = None) -> dict[str, Any]:

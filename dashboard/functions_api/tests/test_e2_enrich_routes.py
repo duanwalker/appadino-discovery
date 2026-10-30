@@ -11,6 +11,8 @@ from contextlib import AbstractContextManager
 from typing import Any
 
 import azure.functions as func
+import function_app
+import httpx
 import pytest
 from discovery.clients.enrichment_provider import (
     EnrichmentResult,
@@ -82,6 +84,41 @@ class _StubProvider:
         self.poll_calls.append((job_id, org_domain))
         idx = min(len(self.poll_calls) - 1, len(self.poll_results) - 1)
         return self.poll_results[idx]
+
+
+_API_KEY = "fe-secret-key-must-never-be-logged"
+
+
+def _provider_http_error(status_code: int, body: dict[str, Any], method: str = "POST") -> httpx.HTTPStatusError:
+    """Built the way httpx builds a real one: the request carries the bearer
+    header, so a test can prove it never reaches the logs."""
+    request = httpx.Request(
+        method,
+        "https://app.fullenrich.com/api/v2/contact/enrich/bulk",
+        headers={"Authorization": f"Bearer {_API_KEY}"},
+    )
+    response = httpx.Response(status_code, json=body, request=request)
+    return httpx.HTTPStatusError(f"HTTP {status_code}", request=request, response=response)
+
+
+class _RejectingSubmitProvider(_StubProvider):
+    def __init__(self, error: httpx.HTTPStatusError) -> None:
+        super().__init__(poll_results=[PollResult(outcome=PollOutcome.PENDING)])
+        self.error = error
+
+    def submit(self, candidate: Any) -> str:
+        self.submit_calls.append(candidate)
+        raise self.error
+
+
+class _RejectingPollProvider(_StubProvider):
+    def __init__(self, error: httpx.HTTPStatusError) -> None:
+        super().__init__(poll_results=[PollResult(outcome=PollOutcome.PENDING)])
+        self.error = error
+
+    def poll(self, job_id: str, org_domain: str | None) -> PollResult:
+        self.poll_calls.append((job_id, org_domain))
+        raise self.error
 
 
 class ExecutedStatement:
@@ -325,3 +362,130 @@ class TestEnrichStatus:
         )
 
         assert response.status_code == 202
+
+
+class TestProviderRejection:
+    """The first live Enrich click: FullEnrich answered 400
+    error.enrichment.first_name.empty and the route raised an unhandled 500 with an
+    empty body. A provider rejection must come back as readable JSON, release the
+    claimed slot, and log status + body without the API key."""
+
+    def test_rejected_submit_returns_502_json_and_releases_slot(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        conn = QueuedConnection(fetchone_queue=[_candidate_row(), {"claimed": True}])
+        monkeypatch.setattr("function_app._conn", lambda: conn)
+        error = _provider_http_error(
+            400, {"code": "error.enrichment.first_name.empty", "message": "First name cannot be empty"}
+        )
+        provider = _RejectingSubmitProvider(error)
+        monkeypatch.setattr("function_app._get_fullenrich_provider", lambda subaccount_id: provider)
+
+        with caplog.at_level("WARNING"):
+            response = enrich_prospect(_request("POST", "/api/prospects/42/enrich", route_params={"id": "42"}))
+
+        assert response.status_code == 502
+        assert response.mimetype == "application/json"
+        body = _json_body(response)
+        assert body["provider_status"] == 400
+        assert body["provider_code"] == "error.enrichment.first_name.empty"
+        assert "error.enrichment.first_name.empty" in body["error"]
+        assert len(provider.submit_calls) == 1
+        assert any("DELETE FROM enrichment_jobs" in s.sql for s in conn.executed)
+        assert (2, "010343943") not in function_app._PENDING_JOBS
+        assert "400" in caplog.text
+        assert "First name cannot be empty" in caplog.text
+        assert _API_KEY not in caplog.text
+        assert "Bearer" not in caplog.text
+
+    def test_logged_body_is_truncated(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        conn = QueuedConnection(fetchone_queue=[_candidate_row(), {"claimed": True}])
+        monkeypatch.setattr("function_app._conn", lambda: conn)
+        provider = _RejectingSubmitProvider(_provider_http_error(400, {"code": "x", "message": "A" * 5000}))
+        monkeypatch.setattr("function_app._get_fullenrich_provider", lambda subaccount_id: provider)
+
+        with caplog.at_level("WARNING"):
+            enrich_prospect(_request("POST", "/api/prospects/42/enrich", route_params={"id": "42"}))
+
+        assert "A" * 500 not in caplog.text
+        assert "A" * 400 in caplog.text
+
+    def test_slot_released_so_next_click_submits_again(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        conn = QueuedConnection(fetchone_queue=[_candidate_row(), {"claimed": True}])
+        monkeypatch.setattr("function_app._conn", lambda: conn)
+        rejecting = _RejectingSubmitProvider(_provider_http_error(400, {"code": "x", "message": "y"}))
+        monkeypatch.setattr("function_app._get_fullenrich_provider", lambda subaccount_id: rejecting)
+        enrich_prospect(_request("POST", "/api/prospects/42/enrich", route_params={"id": "42"}))
+
+        conn2 = QueuedConnection(fetchone_queue=[_candidate_row(), {"claimed": True}])
+        monkeypatch.setattr("function_app._conn", lambda: conn2)
+        working = _StubProvider(poll_results=[PollResult(outcome=PollOutcome.PENDING)])
+        monkeypatch.setattr("function_app._get_fullenrich_provider", lambda subaccount_id: working)
+        monkeypatch.setattr("function_app.ENRICH_POLL_ATTEMPTS", 1)
+        monkeypatch.setattr("function_app.ENRICH_POLL_INTERVAL_S", 0)
+
+        response = enrich_prospect(_request("POST", "/api/prospects/42/enrich", route_params={"id": "42"}))
+
+        assert response.status_code == 202
+        assert len(working.submit_calls) == 1
+
+    def test_status_check_unknown_job_returns_502_and_releases_slot(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        conn = QueuedConnection(fetchone_queue=[_candidate_row()])
+        monkeypatch.setattr("function_app._conn", lambda: conn)
+        error = _provider_http_error(
+            404, {"code": "error.enrichment.not_found", "message": "Enrichment ID not found"}, "GET"
+        )
+        provider = _RejectingPollProvider(error)
+        monkeypatch.setattr("function_app._get_fullenrich_provider", lambda subaccount_id: provider)
+
+        response = enrich_status(
+            _request(
+                "GET", "/api/prospects/42/enrich-status", params={"job_id": "job-xyz"}, route_params={"id": "42"}
+            )
+        )
+
+        assert response.status_code == 502
+        assert _json_body(response)["provider_code"] == "error.enrichment.not_found"
+        assert any("DELETE FROM enrichment_jobs" in s.sql for s in conn.executed)
+
+    def test_status_check_rate_limited_returns_502_and_keeps_slot(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """429 is transient: the paid job is still running, so a retry must resume it
+        rather than release the claim and submit a second one."""
+        conn = QueuedConnection(fetchone_queue=[_candidate_row()])
+        monkeypatch.setattr("function_app._conn", lambda: conn)
+        error = _provider_http_error(429, {"code": "error.rate.limit", "message": "Too many requests"}, "GET")
+        provider = _RejectingPollProvider(error)
+        monkeypatch.setattr("function_app._get_fullenrich_provider", lambda subaccount_id: provider)
+
+        response = enrich_status(
+            _request(
+                "GET", "/api/prospects/42/enrich-status", params={"job_id": "job-xyz"}, route_params={"id": "42"}
+            )
+        )
+
+        assert response.status_code == 502
+        assert _json_body(response)["provider_code"] == "error.rate.limit"
+        assert not any("DELETE FROM enrichment_jobs" in s.sql for s in conn.executed)
+
+    def test_poll_failure_right_after_submit_stays_pending_with_job_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        conn = QueuedConnection(fetchone_queue=[_candidate_row(), {"claimed": True}])
+        monkeypatch.setattr("function_app._conn", lambda: conn)
+        error = _provider_http_error(429, {"code": "error.rate.limit", "message": "Too many requests"}, "GET")
+        provider = _RejectingPollProvider(error)
+        monkeypatch.setattr("function_app._get_fullenrich_provider", lambda subaccount_id: provider)
+        monkeypatch.setattr("function_app.ENRICH_POLL_INTERVAL_S", 0)
+
+        response = enrich_prospect(_request("POST", "/api/prospects/42/enrich", route_params={"id": "42"}))
+
+        assert response.status_code == 202
+        assert _json_body(response) == {"status": "pending", "job_id": "job-xyz"}
+        assert any("UPDATE enrichment_jobs SET job_id" in s.sql for s in conn.executed)
+        assert not any("DELETE FROM enrichment_jobs" in s.sql for s in conn.executed)
