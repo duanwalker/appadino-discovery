@@ -22,6 +22,7 @@ from discovery.clients.enrichment_provider import (
     EnrichmentResult,
     PollOutcome,
 )
+from discovery.clients.fullenrich import describe_failure
 
 logger = logging.getLogger(__name__)
 
@@ -121,10 +122,11 @@ def build_candidate(
 
 @dataclass
 class EnrichAttempt:
-    status: str  # "done" | "pending" | "blocked" | "no_candidate"
+    status: str  # "done" | "pending" | "failed" | "blocked" | "no_candidate"
     reason: str | None = None
     job_id: str | None = None
     result: EnrichmentResult | None = None  # set only when status == "done"
+    provider_status: str | None = None  # set only when status == "failed"
 
 
 def start_enrichment(
@@ -156,15 +158,14 @@ def start_enrichment(
         return check_enrichment(
             provider, job_id, org_domain, poll_attempts=poll_attempts, poll_interval_s=poll_interval_s
         )
-    except httpx.HTTPStatusError as exc:
+    except (httpx.HTTPError, ValueError) as exc:
         # The job exists at the provider once submit returns. Losing its id here would
         # make the caller release the claim, and a retry would submit (and pay) twice;
-        # report it pending so the status route owns the poll failure instead.
+        # report it pending so the status route owns the poll failure instead. Covers
+        # HTTP errors, transport errors (timeouts, resets) and malformed JSON
+        # (json.JSONDecodeError is a ValueError).
         logger.warning(
-            "enrichment %s submitted but status check failed: HTTP %s %s",
-            job_id,
-            exc.response.status_code,
-            exc.response.text[:500],
+            "enrichment %s submitted but status check failed: %s", job_id, describe_failure(exc)
         )
         return EnrichAttempt(status="pending", job_id=job_id)
 
@@ -183,6 +184,13 @@ def check_enrichment(
         poll_result = provider.poll(job_id, org_domain)
         if poll_result.outcome is PollOutcome.DONE:
             return EnrichAttempt(status="done", job_id=job_id, result=poll_result.result)
+        if poll_result.outcome is PollOutcome.FAILED:
+            return EnrichAttempt(
+                status="failed",
+                job_id=job_id,
+                reason=poll_result.failure_reason,
+                provider_status=poll_result.provider_status,
+            )
         if attempt < poll_attempts - 1:
             time.sleep(poll_interval_s)
     return EnrichAttempt(status="pending", job_id=job_id)

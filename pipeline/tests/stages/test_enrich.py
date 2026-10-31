@@ -1,6 +1,8 @@
+import json
 from datetime import UTC, datetime
 
 import httpx
+import pytest
 
 from discovery.clients.enrichment_provider import (
     EnrichmentCandidate,
@@ -231,16 +233,27 @@ class TestStartEnrichment:
         assert len(provider.poll_calls) == 2
 
 
-    def test_poll_failure_after_submit_keeps_job_id_as_pending(self) -> None:
+    @pytest.mark.parametrize("failure", ["http_429", "timeout", "connection_reset", "malformed_json"])
+    def test_poll_failure_after_submit_keeps_job_id_as_pending(self, failure: str) -> None:
         """Once submit returns, the job exists (and is paid for) at the provider — a
         failed status check must not lose its id, or the caller releases the claim
-        and the next click submits a second, separately billed job."""
+        and the next click submits a second, separately billed job. Transport errors
+        and malformed JSON carry no response at all, unlike an HTTP error."""
+        request = httpx.Request("GET", "https://example.invalid/bulk/job-1")
+        errors: dict[str, Exception] = {
+            "http_429": httpx.HTTPStatusError(
+                "rate limited",
+                request=request,
+                response=httpx.Response(429, json={"code": "error.rate.limit"}, request=request),
+            ),
+            "timeout": httpx.ReadTimeout("timed out", request=request),
+            "connection_reset": httpx.ReadError("connection reset", request=request),
+            "malformed_json": json.JSONDecodeError("Expecting value", "not-json", 0),
+        }
 
         class _PollRaises(_StubProvider):
             def poll(self, job_id: str, org_domain: str | None) -> PollResult:
-                request = httpx.Request("GET", "https://example.invalid/bulk/job-1")
-                response = httpx.Response(429, json={"code": "error.rate.limit"}, request=request)
-                raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+                raise errors[failure]
 
         provider = _PollRaises()
         officer = {"name": "Jane Smith", "title": "Executive Director"}
@@ -270,6 +283,24 @@ class TestCheckEnrichment:
         provider = _StubProvider(poll_outcomes=[PollResult(outcome=PollOutcome.PENDING)])
         attempt = check_enrichment(provider, "job-1", "org.org", poll_attempts=1, poll_interval_s=0)
         assert attempt.status == "pending"
+
+    def test_provider_failure_is_failed_with_reason_and_no_result(self) -> None:
+        provider = _StubProvider(
+            poll_outcomes=[
+                PollResult(
+                    outcome=PollOutcome.FAILED,
+                    provider_status="CREDITS_INSUFFICIENT",
+                    failure_reason="FullEnrich could not complete this lookup: credits insufficient",
+                )
+            ]
+        )
+        attempt = check_enrichment(provider, "job-1", "org.org", poll_attempts=3, poll_interval_s=0)
+        assert attempt.status == "failed"
+        assert attempt.result is None
+        assert attempt.job_id == "job-1"
+        assert attempt.provider_status == "CREDITS_INSUFFICIENT"
+        assert attempt.reason == "FullEnrich could not complete this lookup: credits insufficient"
+        assert len(provider.poll_calls) == 1  # terminal: stops polling
 
 
 class TestComputeRetentionExpiresAt:

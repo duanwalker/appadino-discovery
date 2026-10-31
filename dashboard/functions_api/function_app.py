@@ -363,7 +363,7 @@ def update_prospect(req: func.HttpRequest) -> func.HttpResponse:
 
 
 def _get_fullenrich_provider(subaccount_id: str | None) -> FullEnrichProvider | None:
-    api_key = os.environ.get("FULLENRICH_API_KEY")
+    api_key = os.environ.get(fullenrich.API_KEY_ENV)
     if not api_key:
         return None
     return FullEnrichProvider(api_key=api_key, subaccount_id=subaccount_id)
@@ -508,9 +508,7 @@ def _provider_error(action: str, exc: httpx.HTTPStatusError) -> func.HttpRespons
     request, whose headers carry the API key."""
     response = exc.response
     code = fullenrich.error_code(response)
-    logger.warning(
-        "FullEnrich %s failed: HTTP %s %s", action, response.status_code, fullenrich.error_body_excerpt(response)
-    )
+    logger.warning("FullEnrich %s failed: %s", action, fullenrich.describe_failure(exc))
     detail = f"HTTP {response.status_code}" + (f", {code}" if code else "")
     return _json_response(
         {
@@ -531,6 +529,17 @@ def _respond_to_enrich_attempt(
         return _error(attempt.reason or "no usable contact on file", 422)
     if attempt.status == "pending":
         return _json_response({"status": "pending", "job_id": attempt.job_id}, 202)
+    if attempt.status == "failed":
+        # FullEnrich gave up on the job: no enrichments row (it says nothing about the
+        # contact), and the claim is released so a later click can try again.
+        _clear_pending_slot(conn, client_id, ein)
+        return _json_response(
+            {
+                "error": attempt.reason or "FullEnrich could not complete this lookup",
+                "batch_status": attempt.provider_status,
+            },
+            502,
+        )
     assert attempt.job_id is not None and attempt.result is not None  # guaranteed by "done" (discovery.stages.enrich)
     enrichment_id = _persist_enrichment(conn, client_id, ein, prospect_id, attempt.job_id, attempt.result)
     _clear_pending_slot(conn, client_id, ein)
@@ -657,6 +666,11 @@ def enrich_status(req: func.HttpRequest) -> func.HttpResponse:
             if 400 <= status_code < 500 and status_code != 429:
                 _clear_pending_slot(conn, row["client_id"], row["ein"])
             return _provider_error("status check", exc)
+        except (httpx.HTTPError, ValueError) as exc:
+            # Transport error (timeout, reset) or malformed JSON: nothing says the job
+            # is gone, so keep the claim — the next poll resumes the same paid job.
+            logger.warning("FullEnrich status check failed: %s", fullenrich.describe_failure(exc))
+            return _error("Could not get a readable answer from FullEnrich — try again shortly.", 502)
         return _respond_to_enrich_attempt(conn, row["client_id"], row["ein"], row["id"], attempt)
 
 

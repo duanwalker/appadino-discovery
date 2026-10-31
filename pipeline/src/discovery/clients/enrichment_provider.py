@@ -26,6 +26,9 @@ class EnrichmentCandidate:
 class PollOutcome(Enum):
     PENDING = "pending"
     DONE = "done"
+    # The provider gave up on the job (e.g. ran out of credits). Not a no-match:
+    # nothing is known about the contact, so nothing may be recorded as if it were.
+    FAILED = "failed"
 
 
 @dataclass
@@ -49,6 +52,10 @@ class EnrichmentResult:
 class PollResult:
     outcome: PollOutcome
     result: EnrichmentResult | None = None  # set only when outcome is DONE
+    # Set only when outcome is FAILED: the provider's own status name, and a
+    # plain-English reason a reviewer can read on the dashboard row.
+    provider_status: str | None = None
+    failure_reason: str | None = None
 
 
 class EnrichmentProvider(Protocol):

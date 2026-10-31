@@ -108,6 +108,13 @@ class TestParseContactResult:
         )
         assert result.linkedin_url == "https://linkedin.com/in/x"
 
+    def test_phone_only_match_has_not_found_email_status_not_null(self) -> None:
+        result = parse_contact_result(_contact_result(None, None, phone="+12075550100"), "org.org")
+        assert result.phone == "+12075550100"
+        assert result.email is None
+        assert result.email_status == "not_found"
+        assert result.provider_confidence == 88
+
     def test_no_profile_means_no_linkedin_url(self) -> None:
         result = parse_contact_result(_contact_result("jsmith@org.org", "DELIVERABLE"), "org.org")
         assert result.linkedin_url is None
@@ -214,3 +221,25 @@ class TestFullEnrichProvider:
         assert poll_result.outcome is PollOutcome.DONE
         assert poll_result.result.email_status == "not_found"
         assert poll_result.result.provider_confidence == 0
+
+    @pytest.mark.parametrize(
+        ("status", "reason"),
+        [
+            ("CANCELED", "the lookup was canceled"),
+            ("CREDITS_INSUFFICIENT", "credits insufficient"),
+            ("RATE_LIMIT", "rate limit reached"),
+            ("UNKNOWN", "unknown error at FullEnrich"),
+        ],
+    )
+    def test_poll_terminal_failure_is_failed_not_a_no_match(self, monkeypatch, status, reason) -> None:
+        fake = _FakeFullEnrichModule()
+        fake.next_get_response = {"status": status, "data": []}
+        monkeypatch.setattr(fullenrich_adapter, "fullenrich", fake)
+        provider = FullEnrichProvider(api_key="key-1")
+
+        poll_result = provider.poll("job-123", "org.org")
+
+        assert poll_result.outcome is PollOutcome.FAILED
+        assert poll_result.result is None
+        assert poll_result.provider_status == status
+        assert poll_result.failure_reason == f"FullEnrich could not complete this lookup: {reason}"

@@ -2,7 +2,7 @@
 // (`npm test`, Node >= 23.6). fetch is stubbed; nothing leaves the process.
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
-import { enrichProspect } from "../src/api.ts";
+import { checkEnrichStatus, enrichProspect } from "../src/api.ts";
 import { MAX_POLL_MS, STILL_PROCESSING_MESSAGE, runEnrich } from "../src/hooks/enrichFlow.ts";
 
 const realFetch = globalThis.fetch;
@@ -119,4 +119,44 @@ test("resolves through a status poll and calls onDone", async () => {
 
   assert.deepEqual(r.pending, [true, false]);
   assert.equal(r.doneCount(), 1);
+});
+
+test("FullEnrich giving up (failed batch status) during polling shows its reason and clears pending", async () => {
+  // Server shape for a CANCELED / CREDITS_INSUFFICIENT / RATE_LIMIT / UNKNOWN batch.
+  const failed = {
+    error: "FullEnrich could not complete this lookup: credits insufficient",
+    batch_status: "CREDITS_INSUFFICIENT",
+  };
+  const urls: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    urls.push(url);
+    if (url.endsWith("/enrich")) {
+      return new Response(JSON.stringify({ status: "pending", job_id: "job-1" }), { status: 202 });
+    }
+    return new Response(JSON.stringify(failed), { status: 502 });
+  };
+  const r = recorder();
+
+  await runEnrich({
+    ...r.deps,
+    enrich: () => enrichProspect(779),
+    checkStatus: (jobId) => checkEnrichStatus(779, jobId),
+  });
+
+  assert.deepEqual(urls, ["/api/prospects/779/enrich", "/api/prospects/779/enrich-status?job_id=job-1"]);
+  assert.deepEqual(r.pending, [true, false]);
+  assert.equal(r.errors.at(-1), failed.error);
+  assert.equal(r.doneCount(), 0);
+});
+
+test("FullEnrich giving up within the initial request shows its reason and clears pending", async () => {
+  const failed = { error: "FullEnrich could not complete this lookup: the lookup was canceled", batch_status: "CANCELED" };
+  globalThis.fetch = async () => new Response(JSON.stringify(failed), { status: 502 });
+  const r = recorder();
+
+  await runEnrich({ ...r.deps, enrich: () => enrichProspect(779), checkStatus: () => assert.fail("no poll") });
+
+  assert.deepEqual(r.pending, [true, false]);
+  assert.equal(r.errors.at(-1), failed.error);
 });

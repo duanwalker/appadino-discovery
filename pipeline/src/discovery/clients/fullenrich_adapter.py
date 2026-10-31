@@ -17,7 +17,11 @@ from discovery.clients.enrichment_provider import (
     PollOutcome,
     PollResult,
 )
-from discovery.clients.fullenrich import IN_PROGRESS_ERROR_CODE, error_code
+from discovery.clients.fullenrich import (
+    FAILED_STATUS_REASONS,
+    IN_PROGRESS_ERROR_CODE,
+    error_code,
+)
 
 PROVIDER_NAME = "fullenrich"
 ENRICH_FIELDS = ["contact.work_emails", "contact.phones"]
@@ -147,7 +151,9 @@ def parse_contact_result(contact_result: dict[str, Any], org_domain: str | None)
         contact_name=contact_name,
         contact_title=None,
         email=email,
-        email_status=email_status if matched else "not_found",
+        # email_status describes the email: a phone-only match has none, so it is
+        # not_found rather than NULL.
+        email_status=email_status if email else "not_found",
         stale_detail=stale_detail,
         phone=phone,
         linkedin_url=professional_network.get("url"),
@@ -191,6 +197,15 @@ class FullEnrichProvider:
         status = batch_result.get("status")
         if status not in fullenrich.TERMINAL_STATUSES:
             return PollResult(outcome=PollOutcome.PENDING)
+        if status != "FINISHED":
+            # FullEnrich gave up (credits, rate limit, canceled, unknown): this says
+            # nothing about the contact, so it must never read as a no-match.
+            reason = FAILED_STATUS_REASONS.get(str(status), f"status {status}")
+            return PollResult(
+                outcome=PollOutcome.FAILED,
+                provider_status=str(status),
+                failure_reason=f"FullEnrich could not complete this lookup: {reason}",
+            )
 
         data = batch_result.get("data") or []
         if not data:

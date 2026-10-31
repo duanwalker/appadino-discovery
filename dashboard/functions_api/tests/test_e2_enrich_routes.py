@@ -489,3 +489,89 @@ class TestProviderRejection:
         assert _json_body(response) == {"status": "pending", "job_id": "job-xyz"}
         assert any("UPDATE enrichment_jobs SET job_id" in s.sql for s in conn.executed)
         assert not any("DELETE FROM enrichment_jobs" in s.sql for s in conn.executed)
+
+
+def _failed_poll(status: str = "CREDITS_INSUFFICIENT") -> PollResult:
+    return PollResult(
+        outcome=PollOutcome.FAILED,
+        provider_status=status,
+        failure_reason="FullEnrich could not complete this lookup: credits insufficient",
+    )
+
+
+class TestProviderGaveUp:
+    """CANCELED / CREDITS_INSUFFICIENT / RATE_LIMIT / UNKNOWN: FullEnrich gave up on the
+    job. Not a no-match: no enrichments row, the claim is released, and the reviewer
+    reads why."""
+
+    def test_enrich_returns_readable_502_writes_nothing_and_releases_slot(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        conn = QueuedConnection(fetchone_queue=[_candidate_row(), {"claimed": True}])
+        monkeypatch.setattr("function_app._conn", lambda: conn)
+        provider = _StubProvider(poll_results=[_failed_poll()])
+        monkeypatch.setattr("function_app._get_fullenrich_provider", lambda subaccount_id: provider)
+
+        response = enrich_prospect(_request("POST", "/api/prospects/42/enrich", route_params={"id": "42"}))
+
+        assert response.status_code == 502
+        assert _json_body(response) == {
+            "error": "FullEnrich could not complete this lookup: credits insufficient",
+            "batch_status": "CREDITS_INSUFFICIENT",
+        }
+        assert not any("INSERT INTO enrichments" in s.sql for s in conn.executed)
+        assert any("DELETE FROM enrichment_jobs" in s.sql for s in conn.executed)
+        assert (2, "010343943") not in function_app._PENDING_JOBS
+
+    def test_status_route_returns_readable_502_writes_nothing_and_releases_slot(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        conn = QueuedConnection(fetchone_queue=[_candidate_row()])
+        monkeypatch.setattr("function_app._conn", lambda: conn)
+        provider = _StubProvider(poll_results=[_failed_poll("RATE_LIMIT")])
+        monkeypatch.setattr("function_app._get_fullenrich_provider", lambda subaccount_id: provider)
+
+        response = enrich_status(
+            _request(
+                "GET", "/api/prospects/42/enrich-status", params={"job_id": "job-xyz"}, route_params={"id": "42"}
+            )
+        )
+
+        assert response.status_code == 502
+        assert _json_body(response)["batch_status"] == "RATE_LIMIT"
+        assert not any("INSERT INTO enrichments" in s.sql for s in conn.executed)
+        assert any("DELETE FROM enrichment_jobs" in s.sql for s in conn.executed)
+
+
+class TestStatusRouteUnreadableAnswer:
+    """Transport errors and malformed JSON say nothing about the job: keep the claim
+    so the next poll resumes the same paid job instead of resubmitting."""
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            httpx.ReadTimeout("timed out", request=httpx.Request("GET", "https://example.invalid")),
+            httpx.ReadError("connection reset", request=httpx.Request("GET", "https://example.invalid")),
+            json.JSONDecodeError("Expecting value", "not-json", 0),
+        ],
+        ids=["timeout", "connection_reset", "malformed_json"],
+    )
+    def test_returns_502_json_and_keeps_slot(self, monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+        conn = QueuedConnection(fetchone_queue=[_candidate_row()])
+        monkeypatch.setattr("function_app._conn", lambda: conn)
+
+        class _PollRaises(_StubProvider):
+            def poll(self, job_id: str, org_domain: str | None) -> PollResult:
+                raise error
+
+        monkeypatch.setattr("function_app._get_fullenrich_provider", lambda subaccount_id: _PollRaises([]))
+
+        response = enrich_status(
+            _request(
+                "GET", "/api/prospects/42/enrich-status", params={"job_id": "job-xyz"}, route_params={"id": "42"}
+            )
+        )
+
+        assert response.status_code == 502
+        assert "FullEnrich" in _json_body(response)["error"]
+        assert not any("DELETE FROM enrichment_jobs" in s.sql for s in conn.executed)

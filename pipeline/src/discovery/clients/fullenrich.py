@@ -1,21 +1,48 @@
 from __future__ import annotations
 
+import os
+import re
 import time
 from typing import Any
 
 import httpx
 
 BASE_URL = "https://app.fullenrich.com/api/v2"
+API_KEY_ENV = "FULLENRICH_API_KEY"
 
 # Confirmed against https://docs.fullenrich.com/api/v2/contact/enrich/bulk/get (2026-09-19,
 # re-checked 2026-10-29: non-terminal statuses are CREATED and IN_PROGRESS).
 TERMINAL_STATUSES = {"FINISHED", "CANCELED", "CREDITS_INSUFFICIENT", "RATE_LIMIT", "UNKNOWN"}
+
+# Every terminal status except FINISHED means FullEnrich gave up on the batch. Shown
+# to the reviewer as "FullEnrich could not complete this lookup: <reason>".
+FAILED_STATUS_REASONS: dict[str, str] = {
+    "CANCELED": "the lookup was canceled",
+    "CREDITS_INSUFFICIENT": "credits insufficient",
+    "RATE_LIMIT": "rate limit reached",
+    "UNKNOWN": "unknown error at FullEnrich",
+}
 
 # Documented 400 from GET /contact/enrich/bulk/{id} while the batch is still running
 # ("Enrichment not ready, try again in 30 seconds") — a not-yet-done, not a failure.
 IN_PROGRESS_ERROR_CODE = "error.enrichment.in_progress"
 
 ERROR_BODY_LOG_LIMIT = 500
+
+# "Bearer <token>" only. The bare word is fine: FullEnrich's documented 401 message
+# itself says "do not have prefix 'bearer'", and that is worth keeping in logs.
+_BEARER_TOKEN_RE = re.compile(r"\bbearer\s+[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE)
+REDACTED = "[REDACTED]"
+
+
+def redact_credentials(text: str) -> str:
+    """The one place log text from FullEnrich passes through: removes the API key
+    value (when configured) and any "Bearer <token>", e.g. a provider error that
+    echoes the request's Authorization header back."""
+    api_key = os.environ.get(API_KEY_ENV)
+    if api_key:
+        text = text.replace(api_key, REDACTED)
+    return _BEARER_TOKEN_RE.sub(f"Bearer {REDACTED}", text)
 
 
 def error_code(response: httpx.Response) -> str | None:
@@ -30,9 +57,18 @@ def error_code(response: httpx.Response) -> str | None:
 
 
 def error_body_excerpt(response: httpx.Response) -> str:
-    """Response body only, truncated for logs. Never log the request: its headers
-    carry the API key."""
-    return response.text[:ERROR_BODY_LOG_LIMIT]
+    """Response body only, redacted and then truncated for logs (redacting first, so
+    a key cut in half at the limit can't leak its first half). Never log the
+    request: its headers carry the API key."""
+    return redact_credentials(response.text)[:ERROR_BODY_LOG_LIMIT]
+
+
+def describe_failure(exc: Exception) -> str:
+    """Log text for a failed call. Transport errors (timeouts, resets) and malformed
+    JSON have no response, so never assume `exc.response` exists."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP {exc.response.status_code} {error_body_excerpt(exc.response)}"
+    return redact_credentials(f"{type(exc).__name__}: {exc}")[:ERROR_BODY_LOG_LIMIT]
 
 
 def get_credits(api_key: str, client: httpx.Client | None = None) -> dict[str, Any]:
