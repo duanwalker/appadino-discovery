@@ -70,7 +70,7 @@ from psycopg.types.json import Json
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from discovery.clients import fullenrich  # noqa: E402
+from discovery.clients import fullenrich
 
 logger = logging.getLogger(__name__)
 
@@ -461,7 +461,7 @@ def _format_report(client_id: int, result: SpikeResult) -> str:
         lines.append(
             "  - **Flag:** this is currently `false`. Any rows this run writes to `enrichments` "
             "will NOT render in the dashboard's contact columns until this is set `true` for "
-            "client_id={} — the data exists in the DB but is silently invisible until then.".format(client_id)
+            f"client_id={client_id} — the data exists in the DB but is silently invisible until then."
         )
     if not result.fullenrich_subaccount_id:
         lines.append(

@@ -160,6 +160,13 @@ _Session-start document. Read this first — see the implementation brief (`disc
 
 - [ ] **6. CI workflow with a Postgres service container** that runs the full suite including the integration tests. Not started; depends on item 1's integration tests existing first.
 
+  **Current CI (`.github/workflows/ci.yml`, since G1.1) runs only `ruff check .` and `pytest` in `pipeline/`.** It should also run:
+  - the Functions API tests (`dashboard/functions_api`)
+  - the dashboard/web tests: `npm test`, `npx tsc --noEmit`, `npm run build`
+  - mypy
+
+  It should also use a Postgres service container for the real-DB tests. CI was red from at least 2026-10-17, because `ruff check .` failed on two findings in the frozen `pipeline/scripts/e1_fullenrich_spike.py`: an unused `# noqa: E402` and a `.format()` call (UP032). Both were fixed on 2026-10-31 with ruff's behavior-neutral safe fixes.
+
 - [ ] **7. Housekeeping**: repo made private, Postgres `AllowDevMachine` firewall rule removed or documented as intentional, minimal runbook (run a national refresh, onboard a customer by inserting an `icp_configs` row, export, rotate the Anthropic key, restore the DB) sized to the under-2-hours-a-month goal. Not started.
 
 - [ ] **8. Enrichment stays OFF for customer tenants in v1** (`enrichment_enabled` false) pending FullEnrich reseller terms; it remains enabled only on the internal-QA tenant. Payments are out of v1: the first customer is invoiced manually through Appadino.AI LLC. Already true today (see "Notes for cold-start" — `client_id=2`'s `enrichment_enabled` confirmed `false`) — this item is "keep it this way," not new work, unless/until the reconciliation below resolves.
