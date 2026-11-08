@@ -54,8 +54,11 @@ everything else, build+push the image, then re-run the same deploy command.
 ## Adding the Anthropic API key
 
 ```powershell
-az keyvault secret set --vault-name adisc-dev-kv --name appadino-discoveryAI-key --value <key>
+az keyvault secret set --vault-name adisc-dev-kv --name appadino-discovery-<yyyy-mm-dd> --value <key>
 ```
+
+Then set `anthropicKeySecretName` in `main.bicepparam` to the new name and redeploy. Don't repoint the
+job with `az containerapp job secret set`: the next deploy would revert it.
 
 ## Archive cache Storage Account (Stage 2 performance fix)
 

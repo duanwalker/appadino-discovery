@@ -28,6 +28,9 @@ param archiveCacheEnvStorageName string
 @description('Path the archive cache volume is mounted at inside the pipeline container — must match ARCHIVE_CACHE_DIR')
 param archiveCacheMountPath string = '/mnt/irs-archive-cache'
 
+@description('Name of the Key Vault secret holding the Anthropic API key (date-suffixed; changes on each rotation)')
+param anthropicKeySecretName string
+
 var keyVaultSecretsUserRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
 var acrPullRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
 
@@ -82,11 +85,10 @@ resource job 'Microsoft.App/jobs@2023-05-01' = {
           identity: identity.id
         }
         {
-          // Secret name in Key Vault is appadino-discoveryAI-key, not anthropic-api-key
-          // — added under that name by the operator; docs/code reference it as-is
-          // rather than requiring a rename (see STATUS.md, G1.4).
+          // The Key Vault secret is rotated under a new date-suffixed name each time
+          // (see STATUS.md), so its name is a parameter set in main.bicepparam.
           name: 'anthropic-api-key'
-          keyVaultUrl: '${keyVaultExisting.properties.vaultUri}secrets/appadino-discoveryAI-key'
+          keyVaultUrl: '${keyVaultExisting.properties.vaultUri}secrets/${anthropicKeySecretName}'
           identity: identity.id
         }
       ]

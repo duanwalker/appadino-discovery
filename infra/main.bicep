@@ -91,6 +91,9 @@ module storage 'modules/storage.bicep' = {
   }
 }
 
+@description('Name of the Key Vault secret holding the Anthropic API key. Rotations create a new date-suffixed secret; update this param to match.')
+param anthropicKeySecretName string
+
 module containerAppsJob 'modules/containerAppsJob.bicep' = {
   name: 'containerAppsJob'
   params: {
@@ -102,6 +105,7 @@ module containerAppsJob 'modules/containerAppsJob.bicep' = {
     acrName: acr.outputs.name
     image: '${acr.outputs.loginServer}/discovery-pipeline:${pipelineImageTag}'
     archiveCacheEnvStorageName: storage.outputs.envStorageName
+    anthropicKeySecretName: anthropicKeySecretName
   }
   dependsOn: [
     keyVault
@@ -115,7 +119,7 @@ resource keyVaultExisting 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
   ]
 }
 
-// Operator can manage secrets (add appadino-discoveryAI-key [Anthropic], fullenrich-api-key later)
+// Operator can manage secrets (add the Anthropic key secret named by anthropicKeySecretName, fullenrich-api-key later)
 resource kvRoleAssignmentAdmin 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(keyVaultExisting.id, keyVaultAdminPrincipalId, 'kv-secrets-officer')
   scope: keyVaultExisting
