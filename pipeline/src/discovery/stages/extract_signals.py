@@ -13,8 +13,11 @@ from __future__ import annotations
 import logging
 import os
 import re
+import struct
+import sys
 import time
 import zipfile
+import zlib
 from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,6 +25,7 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 import httpx
+import inflate64
 import psycopg
 from psycopg.types.json import Json
 
@@ -601,14 +605,65 @@ def fetch_filing_xml(
     if archive_cache is None:
         _require_archive_on_disk(local_path, f"object_id={object_id}")
         with zipfile.ZipFile(local_path) as transient_archive:
-            data: bytes = transient_archive.read(member)
-            return data
+            return _read_member(transient_archive, member)
     cached_archive = archive_cache.get(local_path)
     if cached_archive is None:
         _require_archive_on_disk(local_path, f"object_id={object_id}")
         cached_archive = zipfile.ZipFile(local_path)
         archive_cache[local_path] = cached_archive
-    return cached_archive.read(member)
+    return _read_member(cached_archive, member)
+
+
+# ZIP compression method 9. IRS switched its TEOS XML archives to Deflate64 partway
+# through 2025 (every entry from 2025_TEOS_XML_05A on; 01A-04A are plain Deflate).
+# The stdlib zipfile can read these archives' directories but raises
+# NotImplementedError("That compression method is not supported") on the members,
+# which the per-filing handler used to count as a tolerated failure (24% of filings
+# in the 2026-11-08 Stage 2 validation run, every one a 2025/2026 submission).
+ZIP_DEFLATE64 = 9
+
+_LOCAL_FILE_HEADER = struct.Struct("<4s22xHH")  # signature, ..., name length, extra length
+_LOCAL_FILE_HEADER_SIGNATURE = b"PK\x03\x04"
+
+
+def _read_member(archive: zipfile.ZipFile, member: str) -> bytes:
+    """Reads one member, decoding Deflate64 entries with inflate64 since zipfile can't.
+    Everything else goes through zipfile unchanged."""
+    info = archive.getinfo(member)
+    if info.compress_type != ZIP_DEFLATE64:
+        data: bytes = archive.read(member)
+        return data
+    return _read_deflate64_member(archive, info)
+
+
+def _read_deflate64_member(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes:
+    """Locates the member's compressed bytes via its local file header (whose name and
+    extra-field lengths can differ from the central directory's), inflates them, and
+    checks size and CRC the way zipfile does for the methods it supports."""
+    fp = archive.fp
+    if fp is None:
+        raise ValueError(f"zip archive is closed; cannot read {info.filename}")
+    fp.seek(info.header_offset)
+    signature, name_length, extra_length = _LOCAL_FILE_HEADER.unpack(fp.read(_LOCAL_FILE_HEADER.size))
+    if signature != _LOCAL_FILE_HEADER_SIGNATURE:
+        raise zipfile.BadZipFile(f"bad local file header for {info.filename}")
+    fp.seek(info.header_offset + _LOCAL_FILE_HEADER.size + name_length + extra_length)
+    compressed = fp.read(info.compress_size)
+    data: bytes = inflate64.Inflater().inflate(compressed)
+    if len(data) != info.file_size or zlib.crc32(data) != info.CRC:
+        raise zipfile.BadZipFile(f"Deflate64 size/CRC mismatch for {info.filename}")
+    return data
+
+
+def _peak_rss_mib() -> int | None:
+    """This process's peak resident memory in MiB. Unlike the Container Apps job
+    UsageBytes metric, it excludes the page cache, which fills with archive reads and
+    otherwise reads as ~2 GiB on any Stage 2 run. None on Windows (no `resource`)."""
+    if sys.platform == "win32":
+        return None
+    import resource
+
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024  # Linux reports KiB
 
 
 _FILING_UPDATE_SQL = """
@@ -847,7 +902,7 @@ def extract_signals_for_survivors(
                     if timing_enabled:
                         logger.info(
                             "Stage 2 progress: %d/%d filings processed (%d parsed, %d failed) "
-                            "timing_s[zip_read=%.1f parse=%.1f db_write=%.1f]",
+                            "timing_s[zip_read=%.1f parse=%.1f db_write=%.1f] peak_rss_mib=%s",
                             filing_index,
                             len(filing_rows),
                             counts["filings_parsed"],
@@ -855,14 +910,17 @@ def extract_signals_for_survivors(
                             timings["zip_read_s"],
                             timings["parse_s"],
                             timings["db_write_s"],
+                            _peak_rss_mib(),
                         )
                     else:
                         logger.info(
-                            "Stage 2 progress: %d/%d filings processed (%d parsed, %d failed)",
+                            "Stage 2 progress: %d/%d filings processed (%d parsed, %d failed) "
+                            "peak_rss_mib=%s",
                             filing_index,
                             len(filing_rows),
                             counts["filings_parsed"],
                             counts["filings_failed"],
+                            _peak_rss_mib(),
                         )
 
                 if ein != ein_state["ein"]:
@@ -952,5 +1010,6 @@ def extract_signals_for_survivors(
     # this invocation's own success rate, not the cumulative total across a crashed
     # run plus its resume. Query `signals` directly for cumulative coverage if needed.
     counts["coverage_pct"] = round(counts["signals_computed"] / len(eins), 4) if eins else None
+    counts["peak_rss_mib"] = _peak_rss_mib()
 
     return counts

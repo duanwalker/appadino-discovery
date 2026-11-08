@@ -10,6 +10,8 @@ dependencies = [
     "anthropic>=0.40",
     "pydantic>=2.7",
     "httpx>=0.27",
+    # Deflate64 decoder: IRS TEOS XML archives use ZIP method 9 from 2025_05A on
+    "inflate64>=1.0.4,<2",
 ]
 
 [project.optional-dependencies]

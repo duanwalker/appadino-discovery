@@ -13,6 +13,7 @@ extract_signals_for_survivors() calls (resume / force-recompute).
 
 from __future__ import annotations
 
+import zipfile
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, ClassVar
@@ -307,6 +308,11 @@ class _RecordingZipFile:
         self.closed = False
         self.open_count = 1
         _RecordingZipFile.instances.append(self)
+
+    def getinfo(self, member: str) -> zipfile.ZipInfo:
+        info = zipfile.ZipInfo(member)
+        info.compress_type = zipfile.ZIP_DEFLATED  # not Deflate64, so reads go through read()
+        return info
 
     def read(self, member: str) -> bytes:
         return f"{self.local_path}:{member}".encode()
