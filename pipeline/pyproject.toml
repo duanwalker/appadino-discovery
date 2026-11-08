@@ -34,3 +34,8 @@ extend-exclude = ["alembic/versions"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: needs a real local Postgres via Docker or local initdb/pg_ctl; skipped when neither is available",
+]

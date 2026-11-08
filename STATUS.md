@@ -80,7 +80,7 @@ _Session-start document. Read this first — see the implementation brief (`disc
   - **Opt-in timing breakdown**: `STAGE2_TIMING=1` in the job's env accumulates zip-read / parse / db-write wall-clock seconds and logs them on the existing progress line.
   - **Bounded-sample CLI**: `discovery filter <client_id> --limit-eins N [--force-refresh-signals] [--eins ...]` truncates the survivor set to N EINs (~1-2 filings each) before Stage 2.
 
-  416/416 tests passing, ruff/mypy clean (`ruff check .` + `mypy src`, this project's documented commands — see `pipeline/README.md`). **Still no real-Postgres integration test suite** (item 1's own first clause) — the above is all unit-tested against hand-rolled fakes, not a real local scratch/CI Postgres; that's still outstanding, not just the live-DB validation below.
+  **Real-Postgres integration tests now exist and pass locally (2026-11-08)** — item 1's first clause, met locally only. `pipeline/tests/stages/test_extract_signals_integration.py` (29 tests, `integration` marker) runs the Stage 2 SQL above for real against a throwaway `postgres:16` Docker container with password auth (falling back to local `initdb`/`pg_ctl`, skipping when neither is available), schema applied by the repo's alembic migrations. `dashboard/functions_api/tests/test_stable_ordering_postgres.py` covers the dashboard's list/export ordering against a `TEST_DATABASE_URL` loopback server. Full pipeline suite 484/484, ruff/mypy clean (`ruff check .` + `mypy src`, see `pipeline/README.md`). **Not yet in CI** — that is item 6. Still open for item 1: the live regression diff, the sampled throughput run with STAGE2_TIMING breakdown and peak memory, and the national-run projection.
 
   **Why "not yet validated" rather than "done": this session's sandbox hard-blocks any Bash command that fetches or uses the Key Vault DB connection string** (a classifier-level denial, not a permission prompt). None of the following happened yet: the step-0 timing breakdown on real filings, a real throughput run for before/after filings/sec + peak RSS, or the regression snapshot diff.
 
@@ -158,7 +158,7 @@ _Session-start document. Read this first — see the implementation brief (`disc
 
 - [ ] **5. Minimal access control for ONE customer**: an unauthenticated caller cannot read any prospects, and `client_id` is derived from the authenticated principal, never caller-controlled. First deliver a short proposal with 2-3 mechanism options (for example Static Web Apps / App Service built-in auth with an allowlist) and tradeoffs; implement only after Duan approves. Not started — no proposal written yet.
 
-- [ ] **6. CI workflow with a Postgres service container** that runs the full suite including the integration tests. Not started; depends on item 1's integration tests existing first.
+- [ ] **6. CI workflow with a Postgres service container** that runs the full suite including the integration tests. Not started; item 1's integration tests now exist (pass locally on Docker with password auth, 2026-11-08) and are what this CI job needs to run.
 
   **Current CI (`.github/workflows/ci.yml`, since G1.1) runs only `ruff check .` and `pytest` in `pipeline/`.** It should also run:
   - the Functions API tests (`dashboard/functions_api`)
