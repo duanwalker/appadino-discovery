@@ -260,16 +260,68 @@ def build_sonnet_request(ein: str, org: dict[str, Any]) -> Request:
     )
 
 
+# The Message Batches API caps one batch at 100,000 requests or 256 MB. A national
+# Haiku pass (~119k survivors at ~3-4 KB per request) is over both, so passes are
+# split into chunks kept well under each limit, whichever binds first.
+BATCH_MAX_REQUESTS = 20_000
+BATCH_MAX_BYTES = 100 * 1024 * 1024
+
+
+def estimate_request_bytes(request: Request) -> int:
+    """Serialized size of one request as it appears in a batch-create body (compact
+    JSON plus a separator) — an estimate, not the SDK's exact wire bytes, which is
+    why BATCH_MAX_BYTES sits at well under half the API's limit."""
+    return len(json.dumps(request, separators=(",", ":")).encode()) + 1
+
+
+def chunk_requests(
+    requests: list[Request],
+    max_requests: int = BATCH_MAX_REQUESTS,
+    max_bytes: int = BATCH_MAX_BYTES,
+) -> list[list[Request]]:
+    """Splits requests, in order, into chunks of at most `max_requests` requests and
+    at most `max_bytes` estimated serialized bytes each."""
+    chunks: list[list[Request]] = []
+    current: list[Request] = []
+    current_bytes = 0
+    for request in requests:
+        size = estimate_request_bytes(request)
+        if size > max_bytes:
+            raise ValueError(f"request {request['custom_id']} alone is {size} bytes, over the {max_bytes}-byte chunk cap")
+        if current and (len(current) >= max_requests or current_bytes + size > max_bytes):
+            chunks.append(current)
+            current, current_bytes = [], 0
+        current.append(request)
+        current_bytes += size
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def submit_batch(client: anthropic.Anthropic, requests: list[Request]) -> str:
+    """Creates one Message Batch and returns its id. Billing starts here, so callers
+    that need to survive a crash must record the id before doing anything else."""
+    batch = client.messages.batches.create(requests=requests)
+    logger.info("submitted batch %s (%d requests)", batch.id, len(requests))
+    return str(batch.id)
+
+
 def run_batch(client: anthropic.Anthropic, requests: list[Request], poll_interval: float = 10.0) -> dict[str, Any]:
     """Submits a batch, polls to completion, and returns {custom_id: parsed_json |
     None}. None means the request errored/expired/was canceled — tolerated per the
-    same §10 philosophy as Stage 2 (one bad request doesn't fail the run)."""
+    same §10 philosophy as Stage 2 (one bad request doesn't fail the run). Single
+    batch, nothing persisted: run_scoring uses chunk_requests/submit_batch/
+    collect_batch instead so a national pass fits the API's limits and resumes."""
     if not requests:
         return {}
-    batch = client.messages.batches.create(requests=requests)
-    logger.info("submitted batch %s (%d requests)", batch.id, len(requests))
+    return collect_batch(client, submit_batch(client, requests), poll_interval)
+
+
+def collect_batch(client: anthropic.Anthropic, batch_id: str, poll_interval: float = 10.0) -> dict[str, Any]:
+    """Polls an already-submitted batch to completion and returns {custom_id:
+    parsed_json | None}, None meaning that request errored/expired/was canceled."""
     while True:
-        batch = client.messages.batches.retrieve(batch.id)
+        batch = client.messages.batches.retrieve(batch_id)
         if batch.processing_status == "ended":
             break
         time.sleep(poll_interval)

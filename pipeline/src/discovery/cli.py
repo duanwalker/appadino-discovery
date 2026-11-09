@@ -69,6 +69,15 @@ def main(argv: list[str] | None = None) -> int:
         "run (e.g. a bounded, known-cost run for a QA tenant) — logged as an override and recorded in "
         "runs.counts.eins_overridden, not combined with the client's normal survivor set",
     )
+    score_parser.add_argument(
+        "--resume-run",
+        type=int,
+        default=None,
+        metavar="RUN_ID",
+        help="Continue an unfinished scoring run: collect the Message Batches it already submitted "
+        "(recorded in runs.counts) instead of paying for them again, then finish the run. Uses the "
+        "run's recorded EINs and Haiku cut, so --eins and --haiku-cut-n are not allowed with it",
+    )
     publish_parser = subparsers.add_parser(
         "publish", help="Run Stages 4-6 + QA — suppress, detect triggers, publish prospects for a client"
     )
@@ -105,20 +114,33 @@ def main(argv: list[str] | None = None) -> int:
         import psycopg
 
         from discovery.stages.filter import select_survivor_eins
-        from discovery.stages.run_scoring import run_scoring
+        from discovery.stages.run_scoring import (
+            ResumeRunError,
+            UnfinishedScoringRunError,
+            run_scoring,
+        )
 
-        if args.eins is not None:
-            try:
-                eins = parse_ein_list(args.eins)
-            except ValueError as exc:
-                score_parser.error(f"--eins: {exc}")
-            # Never touches select_survivor_eins (or the DB) here: the explicit list
-            # is the whole Stage 3 input, so the run's API spend is bounded by it.
-            counts = run_scoring(args.client_id, eins, haiku_cut_n=args.haiku_cut_n, eins_overridden=True)
-        else:
-            with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
-                eins = select_survivor_eins(conn, args.client_id)
-            counts = run_scoring(args.client_id, eins, haiku_cut_n=args.haiku_cut_n)
+        if args.resume_run is not None and (args.eins is not None or args.haiku_cut_n is not None):
+            score_parser.error("--resume-run uses the run's recorded EINs and Haiku cut; drop --eins/--haiku-cut-n")
+        try:
+            if args.resume_run is not None:
+                counts = run_scoring(args.client_id, None, resume_run_id=args.resume_run)
+            elif args.eins is not None:
+                try:
+                    eins = parse_ein_list(args.eins)
+                except ValueError as exc:
+                    score_parser.error(f"--eins: {exc}")
+                # Never touches select_survivor_eins (or the DB) here: the explicit list
+                # is the whole Stage 3 input, so the run's API spend is bounded by it.
+                counts = run_scoring(args.client_id, eins, haiku_cut_n=args.haiku_cut_n, eins_overridden=True)
+            else:
+                with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+                    eins = select_survivor_eins(conn, args.client_id)
+                counts = run_scoring(args.client_id, eins, haiku_cut_n=args.haiku_cut_n)
+        except (UnfinishedScoringRunError, ResumeRunError) as exc:
+            logger.error("score not started: %s", exc)
+            print(f"score not started: {exc}", file=sys.stderr)
+            return 2
         logger.info("score complete: %s", counts)
         return 0
 

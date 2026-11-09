@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from discovery.stages import run_scoring
+from discovery.stages import score as score_module
 from discovery.stages.publish import load_publishable
 from discovery.stages.score import (
     CAPACITY_NOTE,
@@ -479,13 +480,13 @@ def test_run_batch_preserves_successes_and_marks_failed_items_none() -> None:
 
     client = SimpleNamespace(messages=SimpleNamespace(batches=FakeBatches()))
 
-    results = run_scoring.run_batch(client, [{}, {}], poll_interval=0)
+    results = score_module.run_batch(client, [{}, {}], poll_interval=0)
 
     assert results == {"scored-ein": {"pre_score": 91}, "failed-ein": None}
 
 
 def test_batch_results_docstring_defines_none_as_failed_request_without_persistence_state() -> None:
-    docstring = run_scoring.run_batch.__doc__ or ""
+    docstring = score_module.run_batch.__doc__ or ""
 
     assert "None means the request errored/expired/was canceled" in docstring
     assert "doesn't fail the run" in docstring

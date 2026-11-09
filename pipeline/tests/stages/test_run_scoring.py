@@ -130,6 +130,9 @@ class _RunsCursor:
     def fetchone(self) -> tuple[Any, ...]:
         return (1,)  # runs.id for the INSERT ... RETURNING, icp version for the SELECT
 
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        return []  # no unfinished scoring runs
+
     def __enter__(self) -> Self:
         return self
 
@@ -163,11 +166,10 @@ def _run_scoring_offline(monkeypatch: pytest.MonkeyPatch, eins: list[str], **kwa
     monkeypatch.setattr(run_scoring_module, "get_active_icp_config", lambda conn, client_id: {})
     monkeypatch.setattr(run_scoring_module, "_load_scoreable_orgs", lambda conn, eins: {})
 
-    def no_batches(client: object, requests: list[Any]) -> dict[str, Any]:
-        assert requests == []  # nothing scoreable, so nothing may be submitted
-        return {}
+    def no_batches(client: object, requests: list[Any]) -> str:
+        raise AssertionError("nothing scoreable, so nothing may be submitted")
 
-    monkeypatch.setattr(run_scoring_module, "run_batch", no_batches)
+    monkeypatch.setattr(run_scoring_module, "submit_batch", no_batches)
     returned = run_scoring_module.run_scoring(3, eins, database_url="postgresql://offline", **kwargs)
     update = next(params for sql, params in log if sql.startswith("UPDATE runs SET"))
     persisted = update[2].obj  # psycopg Json wrapper around the counts dict
