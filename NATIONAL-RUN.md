@@ -10,7 +10,7 @@ Why not `az containerapp job start --args/--command`: the CLI does offer them, b
 ```powershell
 $rg = 'rg-appadino-discovery-dev'; $jobName = 'adisc-dev-pipeline-job'; $py = 'pipeline\.venv\Scripts\python.exe'
 $bicep = (Resolve-Path infra/modules/containerAppsJob.bicep).Path
-$tag = "national-$(git rev-parse --short HEAD)"
+$tag = 'latest'   # Phase A; B0 switches this to an immutable tag built from main
 $env:DATABASE_URL = az keyvault secret show --vault-name adisc-dev-kv --name db-connection-string --query value -o tsv
 $env:PG_ADMIN_PW  = az keyvault secret show --vault-name adisc-dev-kv --name postgres-admin-password --query value -o tsv
 $ws = az monitor log-analytics workspace show -g $rg -n adisc-dev-law --query customerId -o tsv
@@ -32,11 +32,7 @@ git status --short; $tag
 ```
 **STOP IF** you're not on `main`, `git status` shows a modified `containerAppsJob.bicep`, or either secret came back empty.
 
-**S2.** Build the image from `main`, tagged both `$tag` and `:latest`. The `:latest` image is what the monthly scheduled run uses, and the current one is missing the Deflate64 fix.
-```powershell
-az acr build --registry adiscdevacr -t "discovery-pipeline:$tag" -t discovery-pipeline:latest pipeline
-```
-**STOP IF** the build fails.
+**S2.** Phase A runs on the `:latest` image already pushed, which contains the Deflate64 fix. No build is needed here. Phase B needs a newer image, built in step B0.
 
 ## Phase A: Stage 1-2, `filter 2` (no `--eins`, no `--limit-eins`)
 
@@ -85,11 +81,15 @@ Paste the `filter complete:` line either way.
 
 ## Phase B: Stage 3, `score 2`. Costs money: needs your approval
 
-**B0. BLOCKED: don't run `score 2` on the current code.** `run_batch` (`score.py`) sends every Haiku request in **one** Message Batch. The Batch API allows at most **100,000 requests or 256 MB per batch**, and about 119k orgs at about 3–4 KB each is over both. Before this phase can run, the code needs:
-1. **Split batches.** Submit Haiku requests in chunks well under both limits, for example 20,000 per batch.
-2. **Save batch IDs or resume from `scores`.** Today the batch ID exists only in memory. If the job dies after submitting (the 4 h timeout, or a dropped DB connection during the roughly 119k one-row-per-commit Haiku inserts), the batch still runs and is billed, its results are never read, and a rerun pays for every org again.
+Scoring submits Haiku requests in chunks of at most 20,000 requests or about 100 MB (about 6 batches for 119k orgs). It records each batch ID in the run's `runs.counts` as soon as the batch is submitted. A run that dies can be resumed with `score 2 --resume-run <id>`, which collects the recorded batches instead of paying for them again. While an unfinished run with recorded batches exists, a plain `score 2` refuses to start and exits with code 2.
 
-Each Container Apps execution also retries once automatically (`replicaRetryLimit: 1`), so a failure after submission would pay twice with no action from you. Step B2 sets the retry limit to 0 for this phase.
+**B0.** Rebuild the image from `main` so it contains the chunked scoring code (`7aae80d`). Tag it with an immutable `national-<commit>` tag for Phases B and C, and also as `:latest` for the monthly scheduled run.
+```powershell
+git pull --ff-only; git log --oneline -1
+$tag = "national-$(git rev-parse --short HEAD)"
+az acr build --registry adiscdevacr -t "discovery-pipeline:$tag" -t discovery-pipeline:latest pipeline
+```
+**STOP IF** the build fails or `git log` doesn't show a commit at or after `7aae80d`.
 
 **B1.** Show the survivor count and the cost estimate. Read-only: one DB read and no API calls.
 ```powershell
@@ -116,9 +116,9 @@ print(f"TOTAL  ${h_lo + s_lo:,.0f}-${h_hi + s_hi:,.0f} (ceiling ${h_cap + s_cap:
 print("current prospects by status:", reviewed)
 '@ | & $py -
 ```
-**STOP. Paste this output and approve the dollar range before going on.** At about 119k scoreable orgs and a cut of 3,000, expect about $125–180, with a ceiling of about $345. The brief's $30–60 assumed 50k orgs. These are character-count estimates, not `count_tokens` results. A rerun of this phase re-scores **every** org and pays again; nothing is skipped.
+**STOP. Paste this output and approve the dollar range before going on.** At about 119k scoreable orgs and a cut of 3,000, expect about $125–180, with a ceiling of about $345. The brief's $30–60 assumed 50k orgs. These are character-count estimates, not `count_tokens` results. A resume doesn't add to this. A **new** run (after abandoning one, B7) re-scores every org and pays again.
 
-**B2.** Point the job at `score 2`, with automatic retries off.
+**B2.** Point the job at `score 2`, with automatic retries off. The guard would stop a retry from paying twice, but an automatic retry would still bury the real failure.
 ```powershell
 Set-JobArgs @('score', '2') -retry 0
 ```
@@ -130,16 +130,48 @@ Deploy-Job; Start-Run
 ```
 **STOP IF** the deploy doesn't print `Succeeded` or the execution name is empty.
 
-**B4.** Wait. The batch API usually finishes within an hour but may take up to 24 h, and this job is killed at 4 h.
+**B4.** Wait. A batch usually finishes within an hour but may take up to 24 h, and this job is killed at 4 h.
 ```powershell
 Wait-Run
 ```
 
 **B5.** Read the results.
 ```powershell
-Get-RunLogs "Log_s has 'Stage 3:' or Log_s has 'submitted batch' or Log_s has 'batch ' or Log_s has 'score complete' or Log_s has 'RUN_FAILED' or Log_s has 'ZERO_OUTPUT_RUN'" | Select -Last 12
+Get-RunLogs "Log_s has 'Stage 3:' or Log_s has 'submitted batch' or Log_s has 'recorded ' or Log_s has 'RESUME' or Log_s has 'score complete' or Log_s has 'score not started' or Log_s has 'RUN_FAILED' or Log_s has 'ZERO_OUTPUT_RUN'" | Select -Last 20
 ```
-**STOP IF** there's no `score complete:` line, `RUN_FAILED` or `ZERO_OUTPUT_RUN` appears, `haiku_failed` or `sonnet_failed` is more than a few percent, or `hard_rule_violations` is non-zero. **Do not rerun on failure.** Paste the output first: submitted batches may still be running and billing, and their IDs are in the `submitted batch` lines.
+If there's a `score complete:` line, **STOP IF** `ZERO_OUTPUT_RUN` appears, `haiku_failed` or `sonnet_failed` is more than a few percent, or `hard_rule_violations` is non-zero. Otherwise go to Phase C.
+
+**If B4 ended `Failed` and there's no `score complete:` line, don't start a plain `score 2` again.** Its batches are paid for and may still be running. Use B6 to resume the run:
+- **No `RUN_FAILED` traceback, last lines are `submitted`/`recorded`/`collecting` lines:** it hit the 4 h timeout while waiting on a batch. Resume.
+- **`RUN_FAILED` with a transient cause** (a dropped DB connection, an Anthropic 5xx or overload error): resume.
+- **`RUN_FAILED` with anything else, or `score not started:`:** stop and paste it. `score not started:` means the guard found an unfinished run, and the line names it and gives the resume command.
+
+**B6.** Resume an unfinished run.
+
+1. Find the run id. A new run's ID doesn't appear in any log line; only a resume logs it (`RESUME: continuing scoring run <id>`). Use the newest `scoring` row with status `running` (killed at the timeout) or `failed`, and recorded `batches`.
+   ```powershell
+   @'
+   import os, psycopg
+   with psycopg.connect(os.environ["DATABASE_URL"]) as c:
+       for r in c.execute("""SELECT id, status, started_at, finished_at, counts->'batches', counts->'resumed_times', left(error, 200)
+           FROM runs WHERE client_id = 2 AND stage = 'scoring' ORDER BY id DESC LIMIT 3"""): print(r)
+   '@ | & $py -
+   ```
+2. Point the job at the resume, start it, wait, and read the logs.
+   ```powershell
+   $runId = <id>
+   Set-JobArgs @('score', '2', '--resume-run', "$runId") -retry 0
+   Deploy-Job; Start-Run; Wait-Run
+   ```
+   Then repeat B5.
+
+**A resume can need repeating.** It waits for every recorded batch to end before submitting the remaining chunks. A batch can take up to 24 h and each execution is killed at 4 h, so a resume can itself time out. Repeat step 2 of B6 with the same `$runId` until a `score complete:` line appears. Each resume adds 1 to `resumed_times` and pays only for orgs that no recorded batch covers. Batch results are kept 29 days, so finish within that window.
+
+**B7.** Abandon a stuck run, only if you deliberately want to discard it. For 29 days, the guard refuses a plain `score 2` while this run is `running` or `failed` with recorded batches. `runs.status` has no CHECK constraint, so a new value is allowed:
+```sql
+UPDATE runs SET status = 'abandoned', finished_at = now(), error = coalesce(error || E'\n', '') || 'abandoned by operator' WHERE id = <id> AND client_id = 2 AND stage = 'scoring' AND status IN ('running', 'failed');
+```
+The next plain `score 2` pays again for every org. Cancel any of that run's batches that are still in progress in the Anthropic Console first, or they keep billing. `--resume-run <id>` still accepts an abandoned run if you change your mind.
 
 ## Phase C: Stages 4-6 + QA, `publish 2`
 
