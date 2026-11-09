@@ -115,8 +115,8 @@ resource job 'Microsoft.App/jobs@2023-05-01' = {
             }
           ]
           resources: {
-            cpu: json('1.0')
-            memory: '2Gi'
+            cpu: json('2.0')
+            memory: '4Gi'
           }
           volumeMounts: [
             {
