@@ -1,9 +1,22 @@
+import { operatorHeaders } from "./operatorHeader.ts";
 import type { Client, Prospect, ProspectStatus, Run, SuppressionEntry } from "./types";
+
+async function errorMessage(res: Response): Promise<string> {
+  const text = await res.text();
+  try {
+    const message = (JSON.parse(text) as { error?: unknown } | null)?.error;
+    if (typeof message === "string" && message) return message;
+  } catch {
+    // fall through to the generic message
+  }
+  return `Request failed (HTTP ${res.status})`;
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
+    // operatorHeaders() is {} except under the Vite dev server (see operatorHeader.ts).
+    headers: { "Content-Type": "application/json", ...operatorHeaders(), ...init?.headers },
   });
   // Read as text first: an unhandled server error can arrive with an empty body, and
   // the message shown on the row should be short either way, not a JSON parse error.
@@ -24,9 +37,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
-// Internal dev tool, not customer-facing — see function_app.py's list_clients.
-// No auth exists anywhere in this app yet; this is a bare mechanism for one
-// operator to pick which client_id's data to view during testing.
+// LOCAL OPERATOR MODE ONLY: /api/clients exists only when the Functions API runs
+// under `func start` with DISCOVERY_LOCAL_OPERATOR_MODE on (function_app.py's
+// list_clients_local_operator). The deployed API has no such route.
 export function fetchClients(): Promise<Client[]> {
   return request(`/api/clients`);
 }
@@ -77,8 +90,14 @@ export function fetchRuns(clientId: number, stage?: string, limit = 10): Promise
   return request(`/api/runs?${params}`);
 }
 
-export function exportCsvUrl(clientId: number): string {
-  return `/api/export.csv?client_id=${clientId}`;
+// A fetch rather than a plain <a href> download: a link click can't carry the
+// local operator header. The filename comes from the server's Content-Disposition.
+export async function fetchExportCsv(clientId: number): Promise<{ blob: Blob; filename: string }> {
+  const res = await fetch(`/api/export.csv?client_id=${clientId}`, { headers: operatorHeaders() });
+  if (!res.ok) throw new Error(await errorMessage(res));
+  const disposition = res.headers.get("Content-Disposition") ?? "";
+  const filename = /filename="?([^";]+)"?/.exec(disposition)?.[1] ?? `prospects_client${clientId}.csv`;
+  return { blob: await res.blob(), filename };
 }
 
 export interface EnrichContactResult {

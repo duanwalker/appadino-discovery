@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { fetchClients } from "./api";
+import { setOperatorClientId } from "./operatorHeader.ts";
 import type { Client } from "./types";
 import { RunHealthBanner } from "./components/RunHealthBanner";
 import { ExportButton } from "./components/ExportButton";
@@ -8,10 +9,12 @@ import { SuppressionManager } from "./components/SuppressionManager";
 
 type Tab = "prospects" | "suppression";
 
-// Internal dev tool: which client's data the dashboard is showing. No auth
-// exists anywhere in this app — this is a bare operator convenience, not
-// access control. Selection lives in component state only (session-scoped,
-// resets on reload) per the current scope; not persisted to localStorage/URL.
+// LOCAL OPERATOR MODE ONLY: which client's data the dashboard is showing. The list
+// comes from /api/clients, which exists only in the Functions API's local operator
+// mode; the choice reaches the API as the x-local-operator-client-id header, sent only
+// under the Vite dev server (operatorHeader.ts). Not access control: the deployed API
+// derives the client from the login instead. Selection lives in component state only
+// (session-scoped, resets on reload).
 function useClientSelector(): {
   clients: Client[];
   clientId: number | null;
@@ -20,9 +23,16 @@ function useClientSelector(): {
   error: string | null;
 } {
   const [clients, setClients] = useState<Client[]>([]);
-  const [clientId, setClientId] = useState<number | null>(null);
+  const [clientId, setClientIdState] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Record the operator header's client before the state change, so the child
+  // components' fetches (run in effects after re-render) already carry it.
+  function setClientId(id: number) {
+    setOperatorClientId(id);
+    setClientIdState(id);
+  }
 
   useEffect(() => {
     fetchClients()

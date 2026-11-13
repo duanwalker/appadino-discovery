@@ -98,12 +98,18 @@ takes effect on their next request, then remove the role in SWA.
 ### Local operator mode: LOCAL ONLY, skips login
 
 This mode lets you switch between customers while running `func start` on your own
-machine. Add these to your own `local.settings.json` (never to Azure):
+machine. `local.settings.json.example` has both settings, switched off: the mode is
+an empty string and the email is a placeholder. To turn it on, edit your own
+`local.settings.json` (gitignored, never deployed; never put these in Azure):
 
 ```json
 "DISCOVERY_LOCAL_OPERATOR_MODE": "local-only-skips-login",
 "DISCOVERY_LOCAL_OPERATOR_EMAIL": "you@example.com"
 ```
+
+The mode value must be exactly that string. The email is what `updated_by`
+records for your edits. Restart `func start` after changing either one. To turn the
+mode off, set it back to `""`.
 
 With it on, the API skips the login checks and takes `client_id` from the
 `x-local-operator-client-id` request header. `/api/clients` is registered, and the
@@ -113,5 +119,7 @@ exactly `local-only-skips-login`, if Core Tools' `FUNCTIONS_CORETOOLS_ENVIRONMEN
 (`WEBSITE_INSTANCE_ID`, `CONTAINER_NAME`) is present. So if the setting is copied
 into Azure, the result is no API at all, not an API without login.
 
-The dashboard (`dashboard/web`) doesn't send either header yet. Until it does, it
-can't load data against this API locally (that's gate 2 of item 5).
+Under the Vite dev server (`npm run dev`), the dashboard (`dashboard/web`) sends
+`x-local-operator-client-id` on every `/api` call, for the client picked in its
+switcher. A production build never sends it (`src/operatorHeader.ts`). The
+dashboard doesn't send the SWA login header yet; that's gate 2 of item 5.
