@@ -19,13 +19,13 @@ from typing import Any
 
 import azure.functions as func
 import pytest
+from _auth_helpers import TEST_CLIENT_ID, TEST_EMAIL, customer_headers
 from discovery.stages.publish import upsert_prospect
 from function_app import (
     app,
     create_suppression,
     delete_suppression,
     export_csv,
-    list_clients,
     list_prospects,
     list_runs,
     list_suppression,
@@ -45,7 +45,14 @@ def _request(
     body: dict[str, Any] | bytes | None = None,
 ) -> func.HttpRequest:
     raw_body = body if isinstance(body, bytes) else json.dumps(body or {}).encode()
-    return func.HttpRequest(method=method, url=url, params=params or {}, route_params=route_params or {}, body=raw_body)
+    return func.HttpRequest(
+        method=method,
+        url=url,
+        params=params or {},
+        route_params=route_params or {},
+        body=raw_body,
+        headers=customer_headers(),
+    )
 
 
 def _json_body(response: func.HttpResponse) -> dict[str, Any]:
@@ -112,11 +119,13 @@ def test_prospects_status_check_constraint_rejects_arbitrary_string_at_db_layer(
 
 
 class TestFunctionsApiMalformedInput:
-    def test_list_prospects_missing_client_id_returns_400_without_db(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("function_app._conn", _conn_that_must_not_be_called)
+    def test_list_prospects_without_client_id_uses_the_callers_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # v1 item 5: client_id is no longer a parameter; it comes from client_users.
+        conn = RouteConnection(fetchall=[])
+        monkeypatch.setattr("function_app._conn", lambda: conn)
         response = list_prospects(_request("GET", "/api/prospects"))
-        assert response.status_code == 400
-        assert _json_body(response) == {"error": "client_id is required"}
+        assert response.status_code == 200
+        assert conn.executed[0].params == {"client_id": TEST_CLIENT_ID}
 
     def test_update_prospect_out_of_enum_status_returns_400_without_db(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("function_app._conn", _conn_that_must_not_be_called)
@@ -144,12 +153,12 @@ class TestFunctionsApiMalformedInput:
         assert response.status_code == 400
         assert _json_body(response) == {"error": "action must be 'confirm' or 'dismiss'"}
 
-    def test_list_suppression_malformed_client_id_falls_through_to_db(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_list_suppression_malformed_client_id_param_is_ignored(self, monkeypatch: pytest.MonkeyPatch) -> None:
         conn = RouteConnection(fetchall=[])
         monkeypatch.setattr("function_app._conn", lambda: conn)
         response = list_suppression(_request("GET", "/api/suppression", params={"client_id": "not-an-int"}))
         assert response.status_code == 200
-        assert conn.executed[0].params == ("not-an-int",)
+        assert conn.executed[0].params == (TEST_CLIENT_ID,)
 
     def test_create_suppression_malformed_ein_falls_through_to_insert(self, monkeypatch: pytest.MonkeyPatch) -> None:
         conn = RouteConnection(fetchone={"id": 123})
@@ -158,11 +167,12 @@ class TestFunctionsApiMalformedInput:
             _request(
                 "POST",
                 "/api/suppression",
-                body={"client_id": 2, "ein": "not-an-ein", "org_name": "Synthetic Org", "kind": "client"},
+                body={"client_id": 999, "ein": "not-an-ein", "org_name": "Synthetic Org", "kind": "client"},
             )
         )
         assert response.status_code == 201
         assert conn.executed[0].params["ein"] == "not-an-ein"
+        assert conn.executed[0].params["client_id"] == TEST_CLIENT_ID
 
     def test_delete_suppression_nonexistent_id_returns_clean_404(self, monkeypatch: pytest.MonkeyPatch) -> None:
         conn = RouteConnection(fetchone=None)
@@ -173,28 +183,19 @@ class TestFunctionsApiMalformedInput:
         assert response.status_code == 404
         assert _json_body(response) == {"error": "suppression entry not found"}
 
-    def test_export_csv_missing_client_id_returns_400_without_db(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("function_app._conn", _conn_that_must_not_be_called)
+    def test_export_csv_without_client_id_uses_the_callers_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        conn = RouteConnection(fetchall=[])
+        monkeypatch.setattr("function_app._conn", lambda: conn)
         response = export_csv(_request("GET", "/api/export.csv"))
-        assert response.status_code == 400
-        assert _json_body(response) == {"error": "client_id is required"}
+        assert response.status_code == 200
+        assert conn.executed[0].params == {"client_id": TEST_CLIENT_ID}
 
     def test_list_runs_bad_limit_returns_400_without_db(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("function_app._conn", _conn_that_must_not_be_called)
-        response = list_runs(_request("GET", "/api/runs", params={"client_id": "2", "limit": "many"}))
+        response = list_runs(_request("GET", "/api/runs", params={"limit": "many"}))
         assert response.status_code == 400
         assert _json_body(response) == {"error": "limit must be an integer"}
 
-    def test_list_clients_returns_every_row_unfiltered(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        conn = RouteConnection(fetchall=[{"id": 2, "name": "ARCHITECT Philanthropic Collective"}, {"id": 3, "name": "INTERNAL QA"}])
-        monkeypatch.setattr("function_app._conn", lambda: conn)
-        response = list_clients(_request("GET", "/api/clients"))
-        assert response.status_code == 200
-        assert _json_body(response) == [
-            {"id": 2, "name": "ARCHITECT Philanthropic Collective"},
-            {"id": 3, "name": "INTERNAL QA"},
-        ]
-        assert conn.executed[0].params is None
 
 
 def test_dismiss_suppression_flag_only_clears_prospect_flag_not_suppression_rows(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -206,7 +207,7 @@ def test_dismiss_suppression_flag_only_clears_prospect_flag_not_suppression_rows
             "POST",
             "/api/prospects/42/suppression-review",
             route_params={"id": "42"},
-            body={"action": "dismiss", "updated_by": "lauren@appadino.test"},
+            body={"action": "dismiss", "updated_by": "someone-else@example.test"},
         )
     )
 
@@ -215,7 +216,8 @@ def test_dismiss_suppression_flag_only_clears_prospect_flag_not_suppression_rows
     assert "INSERT INTO suppression" not in sql_log
     assert "DELETE FROM suppression" not in sql_log
     assert "UPDATE prospects SET suppression_flag = NULL" in sql_log
-    assert conn.executed[-1].params == ("lauren@appadino.test", "42")
+    # updated_by is the logged-in email; the body's updated_by is ignored (v1 item 5).
+    assert conn.executed[-1].params == (TEST_EMAIL, "42", TEST_CLIENT_ID)
 
 
 def test_confirm_suppression_flag_adds_client_suppression_then_clears_flag(monkeypatch: pytest.MonkeyPatch) -> None:

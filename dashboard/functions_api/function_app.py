@@ -10,12 +10,16 @@ writes (scores, gap_rank, trigger_*) is read-only here.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import csv
 import io
 import json
 import logging
 import os
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -41,8 +45,156 @@ from discovery.stages.score import ALIGNMENT_CRITERIA
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
+# ANONYMOUS at the Functions-key level on purpose: the front door is Static Web Apps'
+# login (ACCESS-CONTROL-PROPOSAL.md, Option A), and every route below calls
+# _authenticate() first. There is no route that skips it.
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 logger = logging.getLogger(__name__)
+
+# --- Access control (v1 item 5) -----------------------------------------------------
+#
+# Static Web Apps (SWA) puts the logged-in user in this header as base64 JSON
+# ({identityProvider, userId, userDetails, userRoles}) and overwrites any copy a
+# browser sends, so it can be trusted only behind SWA. client_id never comes from the
+# request: it is looked up in client_users by (identityProvider, lower(userDetails)).
+PRINCIPAL_HEADER = "x-ms-client-principal"
+# Invite-only SWA custom role. SWA's built-in "authenticated" role means "anyone with a
+# Microsoft account", so it is deliberately NOT accepted on its own.
+CUSTOMER_ROLE = "customer"
+
+
+@dataclass(frozen=True)
+class Principal:
+    identity_provider: str
+    email: str
+    roles: frozenset[str]
+
+
+@dataclass(frozen=True)
+class Caller:
+    client_id: int
+    email: str  # also what updated_by records
+
+
+def _parse_principal(header_value: str | None) -> Principal | None:
+    """None for anything that isn't a well-formed SWA principal: missing, not base64,
+    not JSON, not an object, blank provider/email, or userRoles not a list of strings.
+    Callers turn None into 401."""
+    if not header_value:
+        return None
+    try:
+        decoded = base64.b64decode(header_value.strip(), validate=True)
+        data = json.loads(decoded.decode("utf-8"))
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    provider = data.get("identityProvider")
+    email = data.get("userDetails")
+    roles = data.get("userRoles")
+    if not isinstance(provider, str) or not provider.strip():
+        return None
+    if not isinstance(email, str) or not email.strip():
+        return None
+    if not isinstance(roles, list) or not all(isinstance(role, str) for role in roles):
+        return None
+    return Principal(provider.strip().lower(), email.strip().lower(), frozenset(roles))
+
+
+def _lookup_client_id(identity_provider: str, email: str) -> int | None:
+    """The client_users row is the only source of a request's client_id. Inactive or
+    missing → None (403). Matching is on lower(email), the same expression as the
+    unique index, so two spellings of one address can't map to two clients."""
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT client_id FROM client_users "
+            "WHERE identity_provider = %(provider)s AND lower(email) = %(email)s AND active",
+            {"provider": identity_provider, "email": email},
+        )
+        row = cur.fetchone()
+    return int(row["client_id"]) if row is not None else None
+
+
+# --- LOCAL-ONLY operator bypass --------------------------------------------------------
+#
+# !! This skips login. It exists so Duan can keep switching between customers while
+# !! running `func start` on his own machine. It can never be on in Azure:
+#   1. it needs DISCOVERY_LOCAL_OPERATOR_MODE set to the exact value below (a typo or
+#      "true"/"1" refuses to start the app rather than being ignored);
+#   2. it needs Core Tools' own markers (FUNCTIONS_CORETOOLS_ENVIRONMENT=true and
+#      AZURE_FUNCTIONS_ENVIRONMENT=Development), which `func start` sets and Azure
+#      does not;
+#   3. if any Azure hosting marker is present while the setting is on, the app refuses
+#      to start at import time, so a setting copied into Azure fails loudly (no API at
+#      all) instead of running without login.
+# When it is off (the default, and always in Azure), /api/clients is not even
+# registered and the operator header below is never read.
+LOCAL_OPERATOR_ENV = "DISCOVERY_LOCAL_OPERATOR_MODE"
+LOCAL_OPERATOR_ENABLE_VALUE = "local-only-skips-login"
+LOCAL_OPERATOR_EMAIL_ENV = "DISCOVERY_LOCAL_OPERATOR_EMAIL"
+LOCAL_OPERATOR_CLIENT_HEADER = "x-local-operator-client-id"
+# Set by the Azure Functions / App Service host (including SWA managed functions),
+# never by Core Tools.
+AZURE_HOST_MARKERS = ("WEBSITE_INSTANCE_ID", "CONTAINER_NAME")
+
+
+def _local_operator_mode(environ: Mapping[str, str]) -> bool:
+    value = environ.get(LOCAL_OPERATOR_ENV)
+    if not value:
+        return False
+    if value != LOCAL_OPERATOR_ENABLE_VALUE:
+        raise RuntimeError(
+            f"{LOCAL_OPERATOR_ENV} must be unset or exactly {LOCAL_OPERATOR_ENABLE_VALUE!r}; "
+            "refusing to start"
+        )
+    azure_markers = [name for name in AZURE_HOST_MARKERS if environ.get(name)]
+    if azure_markers:
+        raise RuntimeError(
+            f"{LOCAL_OPERATOR_ENV} is set but this looks like Azure ({', '.join(azure_markers)} "
+            "present). The local operator bypass skips login; refusing to start. Remove the setting."
+        )
+    if (
+        environ.get("FUNCTIONS_CORETOOLS_ENVIRONMENT", "").lower() != "true"
+        or environ.get("AZURE_FUNCTIONS_ENVIRONMENT") != "Development"
+    ):
+        raise RuntimeError(
+            f"{LOCAL_OPERATOR_ENV} only works under `func start` (Core Tools, Development); refusing to start"
+        )
+    if not environ.get(LOCAL_OPERATOR_EMAIL_ENV, "").strip():
+        raise RuntimeError(f"{LOCAL_OPERATOR_ENV} needs {LOCAL_OPERATOR_EMAIL_ENV} (recorded as updated_by)")
+    return True
+
+
+LOCAL_OPERATOR_MODE = _local_operator_mode(os.environ)
+if LOCAL_OPERATOR_MODE:
+    logger.warning(
+        "LOCAL OPERATOR MODE IS ON: login is skipped and client_id comes from the %s header. "
+        "Local `func start` only.",
+        LOCAL_OPERATOR_CLIENT_HEADER,
+    )
+
+
+def _local_operator_caller(req: func.HttpRequest) -> Caller | func.HttpResponse:
+    raw = (req.headers.get(LOCAL_OPERATOR_CLIENT_HEADER) or "").strip()
+    if not raw.isdigit() or int(raw) <= 0:
+        return _error(f"local operator mode: send the {LOCAL_OPERATOR_CLIENT_HEADER} header", 400)
+    return Caller(client_id=int(raw), email=os.environ[LOCAL_OPERATOR_EMAIL_ENV].strip())
+
+
+def _authenticate(req: func.HttpRequest) -> Caller | func.HttpResponse:
+    """First call in every route. 401: no usable principal. 403: no `customer` role
+    (checked before any DB access), or not an active client_users row."""
+    if LOCAL_OPERATOR_MODE:
+        return _local_operator_caller(req)
+    principal = _parse_principal(req.headers.get(PRINCIPAL_HEADER))
+    if principal is None:
+        return _error("authentication required", 401)
+    if CUSTOMER_ROLE not in principal.roles:
+        return _error("forbidden", 403)
+    client_id = _lookup_client_id(principal.identity_provider, principal.email)
+    if client_id is None:
+        return _error("forbidden", 403)
+    return Caller(client_id=client_id, email=principal.email)
 
 # Mirrors migration 4a2e9c1f7b3d's ck_prospects_status — contacted/responded
 # belong to the Phase 2 Outreach queue and are out of scope for G2.x.
@@ -192,7 +344,7 @@ ENRICH_CANDIDATE_QUERY = """
         WHERE ic2.client_id = p.client_id AND ic2.active = true
         ORDER BY version DESC LIMIT 1
     ) ic ON true
-    WHERE p.id = %(id)s
+    WHERE p.id = %(id)s AND p.client_id = %(client_id)s
 """
 
 
@@ -310,26 +462,25 @@ def _row_to_prospect(row: dict[str, Any]) -> dict[str, Any]:
 
 @app.route(route="prospects", methods=["GET"])
 def list_prospects(req: func.HttpRequest) -> func.HttpResponse:
-    client_id = req.params.get("client_id")
-    if not client_id:
-        return _error("client_id is required")
+    caller = _authenticate(req)
+    if isinstance(caller, func.HttpResponse):
+        return caller
     with _conn() as conn, conn.cursor() as cur:
-        cur.execute(PROSPECT_QUERY, {"client_id": client_id})
+        cur.execute(PROSPECT_QUERY, {"client_id": caller.client_id})
         rows = cur.fetchall()
     return _json_response([_row_to_prospect(r) for r in rows])
 
 
 @app.route(route="prospects/{id}", methods=["PATCH"])
 def update_prospect(req: func.HttpRequest) -> func.HttpResponse:
+    caller = _authenticate(req)
+    if isinstance(caller, func.HttpResponse):
+        return caller
     prospect_id = req.route_params.get("id")
     try:
         body = req.get_json()
     except ValueError:
         return _error("request body must be JSON")
-
-    updated_by = body.get("updated_by")
-    if not updated_by or not str(updated_by).strip():
-        return _error("updated_by is required")
 
     status = body.get("status")
     if status is not None and status not in VALID_STATUSES:
@@ -343,15 +494,16 @@ def update_prospect(req: func.HttpRequest) -> func.HttpResponse:
                 notes = CASE WHEN %(notes_provided)s THEN %(notes)s ELSE notes END,
                 updated_by = %(updated_by)s,
                 updated_at = now()
-            WHERE id = %(id)s
+            WHERE id = %(id)s AND client_id = %(client_id)s
             RETURNING id
             """,
             {
                 "status": status,
                 "notes": body.get("notes"),
                 "notes_provided": "notes" in body,
-                "updated_by": updated_by,
+                "updated_by": caller.email,
                 "id": prospect_id,
+                "client_id": caller.client_id,
             },
         )
         row = cur.fetchone()
@@ -558,9 +710,12 @@ def enrich_prospect(req: func.HttpRequest) -> func.HttpResponse:
     buildable, so a request that would 422 anyway never claims a slot it can't
     use. `_PENDING_JOBS` is a same-instance fast path; `_claim_pending_slot` is
     the real cross-instance guarantee — see both docstrings."""
+    caller = _authenticate(req)
+    if isinstance(caller, func.HttpResponse):
+        return caller
     prospect_id = req.route_params.get("id")
     with _conn() as conn, conn.cursor() as cur:
-        cur.execute(ENRICH_CANDIDATE_QUERY, {"id": prospect_id})
+        cur.execute(ENRICH_CANDIDATE_QUERY, {"id": prospect_id, "client_id": caller.client_id})
         row = cur.fetchone()
         if row is None:
             return _error("prospect not found", 404)
@@ -633,13 +788,16 @@ def enrich_status(req: func.HttpRequest) -> func.HttpResponse:
     """Resume path for a job still pending after enrich_prospect's own bounded
     wait — the dashboard's Enrich button polls this (spinner visible) until it
     resolves, rather than the initial request blocking indefinitely."""
+    caller = _authenticate(req)
+    if isinstance(caller, func.HttpResponse):
+        return caller
     prospect_id = req.route_params.get("id")
     job_id = req.params.get("job_id")
     if not job_id:
         return _error("job_id is required")
 
     with _conn() as conn, conn.cursor() as cur:
-        cur.execute(ENRICH_CANDIDATE_QUERY, {"id": prospect_id})
+        cur.execute(ENRICH_CANDIDATE_QUERY, {"id": prospect_id, "client_id": caller.client_id})
         row = cur.fetchone()
         if row is None:
             return _error("prospect not found", 404)
@@ -676,6 +834,9 @@ def enrich_status(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="prospects/{id}/suppression-review", methods=["POST"])
 def suppression_review(req: func.HttpRequest) -> func.HttpResponse:
+    caller = _authenticate(req)
+    if isinstance(caller, func.HttpResponse):
+        return caller
     prospect_id = req.route_params.get("id")
     try:
         body = req.get_json()
@@ -683,17 +844,15 @@ def suppression_review(req: func.HttpRequest) -> func.HttpResponse:
         return _error("request body must be JSON")
 
     action = body.get("action")
-    updated_by = body.get("updated_by")
     if action not in {"confirm", "dismiss"}:
         return _error("action must be 'confirm' or 'dismiss'")
-    if not updated_by or not str(updated_by).strip():
-        return _error("updated_by is required")
+    updated_by = caller.email
 
     with _conn() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT p.client_id, p.ein, o.name AS org_name FROM prospects p "
-            "JOIN organizations o ON o.ein = p.ein WHERE p.id = %s",
-            (prospect_id,),
+            "JOIN organizations o ON o.ein = p.ein WHERE p.id = %s AND p.client_id = %s",
+            (prospect_id, caller.client_id),
         )
         prospect = cur.fetchone()
         if prospect is None:
@@ -714,8 +873,9 @@ def suppression_review(req: func.HttpRequest) -> func.HttpResponse:
             )
 
         cur.execute(
-            "UPDATE prospects SET suppression_flag = NULL, updated_by = %s, updated_at = now() WHERE id = %s",
-            (updated_by, prospect_id),
+            "UPDATE prospects SET suppression_flag = NULL, updated_by = %s, updated_at = now() "
+            "WHERE id = %s AND client_id = %s",
+            (updated_by, prospect_id, caller.client_id),
         )
         conn.commit()
 
@@ -724,14 +884,14 @@ def suppression_review(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="suppression", methods=["GET"])
 def list_suppression(req: func.HttpRequest) -> func.HttpResponse:
-    client_id = req.params.get("client_id")
-    if not client_id:
-        return _error("client_id is required")
+    caller = _authenticate(req)
+    if isinstance(caller, func.HttpResponse):
+        return caller
     with _conn() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT id, client_id, ein, org_name, kind, source, added_at, partner_window_expires_at "
             "FROM suppression WHERE client_id = %s ORDER BY added_at DESC",
-            (client_id,),
+            (caller.client_id,),
         )
         rows = cur.fetchall()
     return _json_response(rows)
@@ -739,16 +899,19 @@ def list_suppression(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="suppression", methods=["POST"])
 def create_suppression(req: func.HttpRequest) -> func.HttpResponse:
+    caller = _authenticate(req)
+    if isinstance(caller, func.HttpResponse):
+        return caller
     try:
         body = req.get_json()
     except ValueError:
         return _error("request body must be JSON")
 
-    client_id = body.get("client_id")
+    # Any client_id in the body is ignored: the row always belongs to the caller.
     org_name = body.get("org_name")
     kind = body.get("kind")
-    if not client_id or not org_name or not kind:
-        return _error("client_id, org_name, and kind are required")
+    if not org_name or not kind:
+        return _error("org_name and kind are required")
     if kind not in VALID_SUPPRESSION_KINDS:
         return _error(f"kind must be one of {sorted(VALID_SUPPRESSION_KINDS)}")
 
@@ -760,7 +923,7 @@ def create_suppression(req: func.HttpRequest) -> func.HttpResponse:
             RETURNING id
             """,
             {
-                "client_id": client_id,
+                "client_id": caller.client_id,
                 "ein": body.get("ein"),
                 "org_name": org_name,
                 "kind": kind,
@@ -775,9 +938,15 @@ def create_suppression(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="suppression/{id}", methods=["DELETE"])
 def delete_suppression(req: func.HttpRequest) -> func.HttpResponse:
+    caller = _authenticate(req)
+    if isinstance(caller, func.HttpResponse):
+        return caller
     suppression_id = req.route_params.get("id")
     with _conn() as conn, conn.cursor() as cur:
-        cur.execute("DELETE FROM suppression WHERE id = %s RETURNING id", (suppression_id,))
+        cur.execute(
+            "DELETE FROM suppression WHERE id = %s AND client_id = %s RETURNING id",
+            (suppression_id, caller.client_id),
+        )
         row = cur.fetchone()
         conn.commit()
     if row is None:
@@ -941,9 +1110,10 @@ def _render_csv(rows: list[dict[str, Any]]) -> str:
 
 @app.route(route="export.csv", methods=["GET"])
 def export_csv(req: func.HttpRequest) -> func.HttpResponse:
-    client_id = req.params.get("client_id")
-    if not client_id:
-        return _error("client_id is required")
+    caller = _authenticate(req)
+    if isinstance(caller, func.HttpResponse):
+        return caller
+    client_id = caller.client_id
 
     with _conn() as conn, conn.cursor() as cur:
         cur.execute(EXPORT_QUERY, {"client_id": client_id})
@@ -961,11 +1131,12 @@ def export_csv(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="runs", methods=["GET"])
 def list_runs(req: func.HttpRequest) -> func.HttpResponse:
-    client_id = req.params.get("client_id")
+    caller = _authenticate(req)
+    if isinstance(caller, func.HttpResponse):
+        return caller
+    client_id = caller.client_id
     stage = req.params.get("stage")
     limit_param = req.params.get("limit", "10")
-    if not client_id:
-        return _error("client_id is required")
     try:
         limit = max(1, min(int(limit_param), 100))
     except ValueError:
@@ -987,11 +1158,18 @@ def list_runs(req: func.HttpRequest) -> func.HttpResponse:
     return _json_response(rows)
 
 
-@app.route(route="clients", methods=["GET"])
-def list_clients(req: func.HttpRequest) -> func.HttpResponse:
-    """Internal dev tool for the dashboard's client switcher (no auth in this app
-    today — see App.tsx). Unfiltered on purpose: every row, every caller."""
+def list_clients_local_operator(req: func.HttpRequest) -> func.HttpResponse:
+    """LOCAL OPERATOR MODE ONLY: every client, for the dev dashboard's switcher.
+    Registered as /api/clients only when LOCAL_OPERATOR_MODE is on (see the guard at
+    the top of this module), so the deployed API has no such route. The check below
+    is a second lock in case it is ever registered by mistake."""
+    if not LOCAL_OPERATOR_MODE:
+        return _error("not found", 404)
     with _conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT id, name FROM clients ORDER BY id")
         rows = cur.fetchall()
     return _json_response(rows)
+
+
+if LOCAL_OPERATOR_MODE:
+    app.route(route="clients", methods=["GET"])(list_clients_local_operator)

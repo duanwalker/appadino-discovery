@@ -1,4 +1,5 @@
 from discovery.models.archive_manifest import ArchiveManifest
+from discovery.models.client_users import ClientUser
 from discovery.models.clients import Client
 from discovery.models.enrichment_jobs import EnrichmentJob
 from discovery.models.enrichments import Enrichment
@@ -15,6 +16,7 @@ from discovery.models.suppression import Suppression
 __all__ = [
     "ArchiveManifest",
     "Client",
+    "ClientUser",
     "Enrichment",
     "EnrichmentJob",
     "Filing",

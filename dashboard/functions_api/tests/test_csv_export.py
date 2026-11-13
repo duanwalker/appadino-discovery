@@ -13,6 +13,7 @@ from typing import Any, Self
 
 import azure.functions as func
 import pytest
+from _auth_helpers import customer_headers
 from discovery.stages.score import ALIGNMENT_CRITERIA
 from discovery.stages.triggers import TRIGGER_PRIORITY
 from test_function_app import SAMPLE_ROW
@@ -88,7 +89,7 @@ class _Connection:
 def _export(monkeypatch: pytest.MonkeyPatch, rows: list[dict[str, Any]]) -> tuple[str, list[dict[str, str]]]:
     monkeypatch.setattr("function_app._conn", lambda: _Connection(rows))
     response = export_csv(
-        func.HttpRequest(method="GET", url="/api/export.csv", params={"client_id": "2"}, body=b"")
+        func.HttpRequest(method="GET", url="/api/export.csv", params={}, body=b"", headers=customer_headers())
     )
     assert response.status_code == 200
     text = response.get_body().decode("utf-8-sig")
@@ -314,7 +315,7 @@ _FILING_TEXT_MARKERS = ("mission_text", "program_text", "filing_", "filings f3",
 def _executed_sql(monkeypatch: pytest.MonkeyPatch, route: Any) -> str:
     conn = _Connection([])
     monkeypatch.setattr("function_app._conn", lambda: conn)
-    response = route(func.HttpRequest(method="GET", url="/api/x", params={"client_id": "2"}, body=b""))
+    response = route(func.HttpRequest(method="GET", url="/api/x", params={}, body=b"", headers=customer_headers()))
     assert response.status_code == 200
     assert len(conn.executed) == 1
     return conn.executed[0]
@@ -340,7 +341,7 @@ def test_export_query_loads_990_text_and_revenue(monkeypatch: pytest.MonkeyPatch
 def test_response_starts_with_a_single_utf8_bom(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("function_app._conn", lambda: _Connection([_row()]))
     response = export_csv(
-        func.HttpRequest(method="GET", url="/api/export.csv", params={"client_id": "2"}, body=b"")
+        func.HttpRequest(method="GET", url="/api/export.csv", params={}, body=b"", headers=customer_headers())
     )
     body = response.get_body()
     assert body.startswith(codecs.BOM_UTF8)

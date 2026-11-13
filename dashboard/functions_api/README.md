@@ -51,15 +51,67 @@ this app currently only runs via `func start` against a local settings file.
 
 ## Endpoints
 
-- `GET  /api/prospects?client_id=`
-- `PATCH /api/prospects/{id}` — body `{status?, notes?, updated_by}`
-- `POST /api/prospects/{id}/suppression-review` — body `{action: "confirm"|"dismiss", updated_by}`
-- `GET  /api/suppression?client_id=`
-- `POST /api/suppression` — body `{client_id, ein?, org_name, kind, source}`
-- `DELETE /api/suppression/{id}`
-- `GET  /api/export.csv?client_id=` — same column set as `pipeline/output/prospects_client2.csv`
-- `GET  /api/runs?client_id=&stage=&limit=`
+Every route needs a logged-in caller (see "Access control" below). None takes
+`client_id`: it comes from the caller's `client_users` row. Anything a request
+sends as `client_id` is ignored.
 
-No auth is implemented yet — flagged as a pre-go-live gap alongside the
-personal-API-key item already in STATUS.md's cold-start notes. Fine for a
-single-operator dev review, not for handing Lauren a public URL.
+- `GET  /api/prospects`
+- `PATCH /api/prospects/{id}` — body `{status?, notes?}`
+- `POST /api/prospects/{id}/enrich`
+- `GET  /api/prospects/{id}/enrich-status?job_id=`
+- `POST /api/prospects/{id}/suppression-review` — body `{action: "confirm"|"dismiss"}`
+- `GET  /api/suppression`
+- `POST /api/suppression` — body `{ein?, org_name, kind, source?}`
+- `DELETE /api/suppression/{id}`
+- `GET  /api/export.csv` — same column set as `pipeline/output/prospects_client2.csv`
+- `GET  /api/runs?stage=&limit=`
+
+`/api/clients` exists only in local operator mode (below).
+
+## Access control (v1 item 5, ACCESS-CONTROL-PROPOSAL.md Option A)
+
+Each route calls `_authenticate(req)` before anything else:
+
+1. It reads the `x-ms-client-principal` header that Static Web Apps adds after login
+   (base64 JSON: `identityProvider`, `userDetails`, `userRoles`). If the header is
+   missing or malformed, the answer is **401**.
+2. `userRoles` must contain `customer`, the invite-only SWA role. Otherwise the
+   answer is **403**, before any database query.
+3. It looks up `client_users` by (`identity_provider`, `lower(email)`). If there is
+   no row, or the row has `active = false`, the answer is **403**. The row's
+   `client_id` is the only tenant the request can touch, and the email becomes
+   `updated_by`.
+
+A route that takes a row id (`PATCH`/`enrich`/`enrich-status`/`suppression-review`
+on a prospect, and `DELETE` on a suppression entry) matches on that id **and** the
+caller's `client_id`. Another customer's row looks the same as a missing one:
+**404**.
+
+The header can only be trusted behind SWA, which overwrites any copy a browser
+sends. Never expose this API on its own address.
+
+To add a customer: insert `client_users (identity_provider, email, client_id)`, for
+example `('aad', 'lauren@example.org', 2)`, and invite them in SWA with the
+`customer` role. To remove one: `UPDATE client_users SET active = false ...`, which
+takes effect on their next request, then remove the role in SWA.
+
+### Local operator mode: LOCAL ONLY, skips login
+
+This mode lets you switch between customers while running `func start` on your own
+machine. Add these to your own `local.settings.json` (never to Azure):
+
+```json
+"DISCOVERY_LOCAL_OPERATOR_MODE": "local-only-skips-login",
+"DISCOVERY_LOCAL_OPERATOR_EMAIL": "you@example.com"
+```
+
+With it on, the API skips the login checks and takes `client_id` from the
+`x-local-operator-client-id` request header. `/api/clients` is registered, and the
+host logs a warning at startup. The app **refuses to start** if the value isn't
+exactly `local-only-skips-login`, if Core Tools' `FUNCTIONS_CORETOOLS_ENVIRONMENT=true`
+/ `AZURE_FUNCTIONS_ENVIRONMENT=Development` aren't set, or if an Azure host marker
+(`WEBSITE_INSTANCE_ID`, `CONTAINER_NAME`) is present. So if the setting is copied
+into Azure, the result is no API at all, not an API without login.
+
+The dashboard (`dashboard/web`) doesn't send either header yet. Until it does, it
+can't load data against this API locally (that's gate 2 of item 5).

@@ -26,6 +26,7 @@ from typing import Any, Self
 
 import azure.functions as func
 import pytest
+from _auth_helpers import customer_headers
 from test_function_app import SAMPLE_ROW
 
 import function_app as api
@@ -92,7 +93,7 @@ def download(
     conn = Connection(rows)
     monkeypatch.setattr(api, "_conn", lambda: conn)
     response = api.export_csv(func.HttpRequest(
-        method="GET", url="/api/export.csv", params={"client_id": "2"}, body=b"",
+        method="GET", url="/api/export.csv", params={}, body=b"", headers=customer_headers(),
     ))
     assert response.status_code == 200
     body = response.get_body()
@@ -318,13 +319,14 @@ def test_queries_remain_separate_with_nonempty_result(
     monkeypatch.setattr(api, "_conn", lambda: conn)
     handler = api.list_prospects if route == "list" else api.export_csv
     response = handler(func.HttpRequest(
-        method="GET", url=f"/api/{route}", params={"client_id": "2"}, body=b"",
+        method="GET", url=f"/api/{route}", params={}, body=b"", headers=customer_headers(),
     ))
     assert response.status_code == 200
     expected = api.PROSPECT_QUERY if route == "list" else api.EXPORT_QUERY
     forbidden = api.EXPORT_QUERY if route == "list" else api.PROSPECT_QUERY
     assert expected != forbidden
-    assert conn.executed == [(expected, {"client_id": "2"})]
+    # The caller's client_id (an int from client_users), never a request parameter.
+    assert conn.executed == [(expected, {"client_id": 2})]
     assert all(sql != forbidden for sql, _ in conn.executed)
     for field in ("mission_text", "program_text"):
         assert (field in expected.lower()) is (route == "export")

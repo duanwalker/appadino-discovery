@@ -9,6 +9,7 @@ from typing import Any
 
 import azure.functions as func
 import pytest
+from _auth_helpers import customer_headers
 from discovery.clients.enrichment_provider import PollOutcome, PollResult
 from function_app import (
     _prospect_row_to_csv_dict,
@@ -24,6 +25,7 @@ def _request(method: str, route: str, *, params: dict[str, str] | None = None) -
         url=f"http://localhost/api{route}",
         params=params or {},
         route_params={"id": "42"},
+        headers=customer_headers(),
         body=b"{}",
     )
 

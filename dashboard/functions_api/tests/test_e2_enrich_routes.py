@@ -14,6 +14,7 @@ import azure.functions as func
 import function_app
 import httpx
 import pytest
+from _auth_helpers import customer_headers
 from discovery.clients.enrichment_provider import (
     EnrichmentResult,
     PollOutcome,
@@ -29,7 +30,14 @@ def _request(
     params: dict[str, str] | None = None,
     route_params: dict[str, str] | None = None,
 ) -> func.HttpRequest:
-    return func.HttpRequest(method=method, url=url, params=params or {}, route_params=route_params or {}, body=b"{}")
+    return func.HttpRequest(
+        method=method,
+        url=url,
+        params=params or {},
+        route_params=route_params or {},
+        body=b"{}",
+        headers=customer_headers(),
+    )
 
 
 def _json_body(response: func.HttpResponse) -> dict[str, Any]:
